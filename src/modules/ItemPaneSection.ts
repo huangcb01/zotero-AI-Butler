@@ -31,6 +31,104 @@ interface ChatState {
 // 递增的对话对 ID 计数器
 let quickChatPairIdCounter = 0;
 
+// 快速提问窗口字体大小（可调）
+const QUICK_CHAT_MIN_FONT_SIZE = 11;
+const QUICK_CHAT_MAX_FONT_SIZE = 18;
+const QUICK_CHAT_DEFAULT_FONT_SIZE = 12;
+
+let quickChatMarkdownParser: null | ((markdown: string) => string) = null;
+
+async function ensureQuickChatMarkdownParser(): Promise<void> {
+  if (quickChatMarkdownParser) return;
+  const { marked } = await import("marked");
+  marked.setOptions({ gfm: true, breaks: true });
+  quickChatMarkdownParser = (markdown: string) => marked.parse(markdown) as string;
+}
+
+function renderQuickChatMarkdown(markdown: string): string {
+  if (!quickChatMarkdownParser) {
+    return escapeHtmlForChat(markdown);
+  }
+  try {
+    const html = quickChatMarkdownParser(markdown);
+    const latexRendered = renderLatexForQuickChat(html);
+    return sanitizeHtmlForXhtml(latexRendered);
+  } catch {
+    return escapeHtmlForChat(markdown);
+  }
+}
+
+function cleanLatexForQuickChat(latex: string): string {
+  return latex
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, "");
+}
+
+function renderLatexForQuickChat(content: string): string {
+  let result = content;
+
+  // Block formulas
+  result = result.replace(/\$\$([\s\S]*?)\$\$/g, (_m: string, formula: string) => {
+    try {
+      const rendered = katex.renderToString(cleanLatexForQuickChat(formula.trim()), {
+        throwOnError: false,
+        displayMode: true,
+        output: "html",
+        trust: true,
+        strict: false,
+      });
+      return `<div class="katex-scroll-container" style="width: 100%; overflow-x: auto; overflow-y: visible;"><div class="katex-display">${rendered}</div></div>`;
+    } catch {
+      return _m;
+    }
+  });
+
+  // Inline formulas
+  const inlineRegex = new RegExp("(?<!\\$)\\$(?!\\$)([^\\$\\n]+?)\\$(?!\\$)", "g");
+  result = result.replace(inlineRegex, (_m: string, formula: string) => {
+    try {
+      const rendered = katex.renderToString(cleanLatexForQuickChat(formula.trim()), {
+        throwOnError: false,
+        displayMode: false,
+        output: "html",
+        trust: true,
+        strict: false,
+      });
+      if (rendered.length > INLINE_FORMULA_TO_BLOCK_THRESHOLD) {
+        return `<div class="katex-scroll-container" style="width: 100%; overflow-x: auto; overflow-y: visible;"><div class="katex-display">${rendered}</div></div>`;
+      }
+      return `<span class="katex-inline">${rendered}</span>`;
+    } catch {
+      return _m;
+    }
+  });
+
+  return result;
+}
+
+function sanitizeHtmlForXhtml(html: string): string {
+  return html
+    .replace(/<hr\s*(?:([^>/]*))?>/gi, "<hr $1/>")
+    .replace(/<br\s*(?:([^>/]*))?>/gi, "<br $1/>")
+    .replace(/<img\s+([^>]*)(?<!\/)>/gi, "<img $1/>")
+    .replace(/<input\s+([^>]*)(?<!\/)>/gi, "<input $1/>")
+    .replace(/<meta\s+([^>]*)(?<!\/)>/gi, "<meta $1/>")
+    .replace(/<link\s+([^>]*)(?<!\/)>/gi, "<link $1/>")
+    .replace(/\s+\/>/g, "/>")
+    .replace(new RegExp("<(?=[^a-zA-Z/?!])", "g"), "&lt;");
+}
+
+function safeSetQuickChatMarkdown(
+  element: HTMLElement,
+  markdown: string,
+): void {
+  try {
+    element.innerHTML = renderQuickChatMarkdown(markdown);
+  } catch {
+    element.innerHTML = escapeHtmlForChat(markdown);
+  }
+}
+
 /**
  * 内联公式转块级公式的阈值（渲染后HTML字符数）
  * 当内联公式渲染后的HTML长度超过此阈值时，自动转换为可滚动的块级公式
@@ -1772,6 +1870,14 @@ function renderChatArea(
   doc: Document,
   item: Zotero.Item,
 ): void {
+  const rawFontSize = Number(getPref("quickChatFontSize" as any));
+  let quickChatFontSize =
+    Number.isFinite(rawFontSize) &&
+    rawFontSize >= QUICK_CHAT_MIN_FONT_SIZE &&
+    rawFontSize <= QUICK_CHAT_MAX_FONT_SIZE
+      ? rawFontSize
+      : QUICK_CHAT_DEFAULT_FONT_SIZE;
+
   const chatArea = doc.createElement("div");
   chatArea.id = "ai-butler-inline-chat";
   chatArea.style.cssText = `
@@ -1782,6 +1888,63 @@ function renderChatArea(
     overflow: hidden;
     background: transparent;
   `;
+
+  const toolbar = doc.createElement("div");
+  toolbar.style.cssText = `
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+    background: rgba(128, 128, 128, 0.05);
+    font-size: 11px;
+  `;
+
+  const toolbarLabel = doc.createElement("span");
+  toolbarLabel.textContent = "快速提问";
+  toolbarLabel.style.cssText = `
+    color: #666;
+    font-weight: 600;
+  `;
+
+  const fontControl = doc.createElement("div");
+  fontControl.style.cssText = `
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  `;
+
+  const fontDecBtn = doc.createElement("button");
+  fontDecBtn.textContent = "A-";
+  const fontIncBtn = doc.createElement("button");
+  fontIncBtn.textContent = "A+";
+  const fontSizeLabel = doc.createElement("span");
+
+  const fontBtnStyle = `
+    min-width: 28px;
+    height: 22px;
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1;
+  `;
+  fontDecBtn.style.cssText = fontBtnStyle;
+  fontIncBtn.style.cssText = fontBtnStyle;
+  fontSizeLabel.style.cssText = `
+    min-width: 36px;
+    text-align: center;
+    color: #666;
+    font-size: 11px;
+  `;
+
+  fontControl.appendChild(fontDecBtn);
+  fontControl.appendChild(fontSizeLabel);
+  fontControl.appendChild(fontIncBtn);
+  toolbar.appendChild(toolbarLabel);
+  toolbar.appendChild(fontControl);
 
   // 消息显示区
   const messagesArea = doc.createElement("div");
@@ -1819,6 +1982,31 @@ function renderChatArea(
     background: transparent;
   `;
 
+  const applyQuickChatFontSize = () => {
+    messagesArea.style.fontSize = `${quickChatFontSize}px`;
+    inputBox.style.fontSize = `${Math.max(quickChatFontSize, 12)}px`;
+    fontSizeLabel.textContent = `${quickChatFontSize}px`;
+    setPref("quickChatFontSize" as any, quickChatFontSize as any);
+  };
+
+  fontDecBtn.addEventListener("click", () => {
+    quickChatFontSize = Math.max(
+      QUICK_CHAT_MIN_FONT_SIZE,
+      quickChatFontSize - 1,
+    );
+    applyQuickChatFontSize();
+  });
+
+  fontIncBtn.addEventListener("click", () => {
+    quickChatFontSize = Math.min(
+      QUICK_CHAT_MAX_FONT_SIZE,
+      quickChatFontSize + 1,
+    );
+    applyQuickChatFontSize();
+  });
+
+  applyQuickChatFontSize();
+
   const sendBtn = doc.createElement("button");
   sendBtn.textContent = "发送";
   sendBtn.style.cssText = `
@@ -1834,6 +2022,7 @@ function renderChatArea(
 
   inputArea.appendChild(inputBox);
   inputArea.appendChild(sendBtn);
+  chatArea.appendChild(toolbar);
   chatArea.appendChild(messagesArea);
   chatArea.appendChild(inputArea);
   body.appendChild(chatArea);
@@ -1934,7 +2123,17 @@ function renderChatArea(
       border-radius: 6px;
       border-left: 3px solid #59c0bc;
     `;
-    userMsgDiv.innerHTML = `<strong>👤 您:</strong> ${escapeHtmlForChat(question)}`;
+    const userTitle = doc.createElement("strong");
+    userTitle.textContent = "👤 您:";
+    const userContentDiv = doc.createElement("div");
+    userContentDiv.style.cssText = `
+      margin-top: 6px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    `;
+    safeSetQuickChatMarkdown(userContentDiv, question);
+    userMsgDiv.appendChild(userTitle);
+    userMsgDiv.appendChild(userContentDiv);
     pairWrapper.appendChild(userMsgDiv);
 
     // 创建 AI 回复区域
@@ -1946,7 +2145,17 @@ function renderChatArea(
       border-radius: 6px;
       border-left: 3px solid #667eea;
     `;
-    aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong> <em style="color: #999;">思考中...</em>`;
+    const aiTitle = doc.createElement("strong");
+    aiTitle.textContent = "🤖 AI管家:";
+    const aiContentDiv = doc.createElement("div");
+    aiContentDiv.style.cssText = `
+      margin-top: 6px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    `;
+    aiContentDiv.innerHTML = `<em style="color: #999;">思考中...</em>`;
+    aiMsgDiv.appendChild(aiTitle);
+    aiMsgDiv.appendChild(aiContentDiv);
     pairWrapper.appendChild(aiMsgDiv);
 
     // 创建保存按钮区域（初始隐藏）
@@ -1981,6 +2190,10 @@ function renderChatArea(
     try {
       // 导入 LLMClient
       const { default: LLMClient } = await import("./llmClient");
+      await ensureQuickChatMarkdownParser();
+
+      // parser 就绪后再渲染一次，确保用户提问按 Markdown 显示
+      safeSetQuickChatMarkdown(userContentDiv, question);
 
       // 快速提问的关键：每次只发送论文+当前问题，不累积历史
       const conversationHistory = [{ role: "user", content: question }];
@@ -1993,14 +2206,14 @@ function renderChatArea(
         (chunk: string) => {
           fullResponse += chunk;
           // 流式更新 AI 回复
-          aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong><br/>${escapeHtmlForChat(fullResponse)}`;
+          safeSetQuickChatMarkdown(aiContentDiv, fullResponse);
           // 滚动到底部
           messagesArea.scrollTop = messagesArea.scrollHeight;
         },
       );
 
       // 完成后最终更新
-      aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong><br/>${escapeHtmlForChat(fullResponse)}`;
+      safeSetQuickChatMarkdown(aiContentDiv, fullResponse);
 
       // 显示保存按钮
       saveArea.style.display = "flex";
@@ -2032,7 +2245,7 @@ function renderChatArea(
       });
     } catch (err: any) {
       ztoolkit.log("[AI-Butler] 快速提问发送失败:", err);
-      aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong> <span style="color: #f44336;">❌ 错误: ${err?.message || "发送失败"}</span>`;
+      aiContentDiv.innerHTML = `<span style="color: #f44336;">❌ 错误: ${escapeHtmlForChat(err?.message || "发送失败")}</span>`;
     } finally {
       // 恢复状态
       currentChatState.isChatting = false;
