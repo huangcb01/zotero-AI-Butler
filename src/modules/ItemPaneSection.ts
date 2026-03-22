@@ -36,6 +36,8 @@ let quickChatPairIdCounter = 0;
 const QUICK_CHAT_MIN_FONT_SIZE = 11;
 const QUICK_CHAT_MAX_FONT_SIZE = 18;
 const QUICK_CHAT_DEFAULT_FONT_SIZE = 12;
+const QUICK_CHAT_MIN_HEIGHT = 220;
+const QUICK_CHAT_DEFAULT_HEIGHT = 320;
 
 let quickChatMarkdownParser: null | ((markdown: string) => string) = null;
 
@@ -1871,6 +1873,12 @@ function renderChatArea(
   doc: Document,
   item: Zotero.Item,
 ): void {
+  const rawHeight = Number(getPref("quickChatHeight" as any));
+  const quickChatHeight =
+    Number.isFinite(rawHeight) && rawHeight >= QUICK_CHAT_MIN_HEIGHT
+      ? rawHeight
+      : QUICK_CHAT_DEFAULT_HEIGHT;
+
   const rawFontSize = Number(getPref("quickChatFontSize" as any));
   let quickChatFontSize =
     Number.isFinite(rawFontSize) &&
@@ -1888,6 +1896,7 @@ function renderChatArea(
     border-radius: 6px;
     overflow: hidden;
     background: transparent;
+    height: ${quickChatHeight}px;
   `;
 
   const toolbar = doc.createElement("div");
@@ -1950,7 +1959,8 @@ function renderChatArea(
   // 消息显示区
   const messagesArea = doc.createElement("div");
   messagesArea.style.cssText = `
-    max-height: 200px;
+    flex: 1;
+    min-height: 120px;
     overflow-y: auto;
     padding: 8px;
     font-size: 12px;
@@ -2026,7 +2036,17 @@ function renderChatArea(
   chatArea.appendChild(toolbar);
   chatArea.appendChild(messagesArea);
   chatArea.appendChild(inputArea);
+
+  const chatResizeHandle = createResizeHandle(
+    doc,
+    chatArea,
+    "quickChatHeight",
+    QUICK_CHAT_MIN_HEIGHT,
+  );
+  chatResizeHandle.style.display = "none";
+
   body.appendChild(chatArea);
+  body.appendChild(chatResizeHandle);
 
   // 快速提问按钮点击事件 - 打开时加载 PDF 内容
   const quickChatBtn = body.querySelector(
@@ -2036,6 +2056,7 @@ function renderChatArea(
     quickChatBtn.addEventListener("click", async () => {
       if (chatArea.style.display === "none") {
         chatArea.style.display = "flex";
+        chatResizeHandle.style.display = "flex";
         quickChatBtn.style.background = "rgba(89, 192, 188, 0.15)";
         quickChatBtn.style.borderColor = "#4db6ac";
         inputBox.focus();
@@ -2071,6 +2092,7 @@ function renderChatArea(
         }
       } else {
         chatArea.style.display = "none";
+        chatResizeHandle.style.display = "none";
         quickChatBtn.style.background = "transparent";
         quickChatBtn.style.borderColor = "#59c0bc";
       }
@@ -2409,6 +2431,7 @@ function createResizeHandle(
   doc: Document,
   target: HTMLElement,
   prefKey: string,
+  minHeight = 50,
 ): HTMLElement {
   const resizeHandle = doc.createElement("div");
   resizeHandle.style.cssText = `
@@ -2437,7 +2460,7 @@ function createResizeHandle(
   doc.addEventListener("mousemove", (e: MouseEvent) => {
     if (!isResizing) return;
     const deltaY = e.clientY - startY;
-    const newHeight = Math.max(50, startHeight + deltaY);
+    const newHeight = Math.max(minHeight, startHeight + deltaY);
     target.style.height = `${newHeight}px`;
   });
 
