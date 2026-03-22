@@ -499,7 +499,7 @@ export class NoteGenerator {
    * // 返回格式化的 HTML,公式被正确标记
    * ```
    */
-  private static convertMarkdownToNoteHTML(markdown: string): string {
+  public static convertMarkdownToNoteHTML(markdown: string): string {
     // ===== 步骤 1: 保护公式，避免被 marked 误处理（将下划线转成 <em>）=====
     const formulas: Array<{ content: string; isBlock: boolean }> = [];
     let processedMarkdown = markdown;

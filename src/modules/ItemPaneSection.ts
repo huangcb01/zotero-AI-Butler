@@ -14,6 +14,7 @@ import { config } from "../../package.json";
 import { getString, getLocaleID } from "../utils/locale";
 import { getPref, setPref } from "../utils/prefs";
 import katex from "katex";
+import { NoteGenerator } from "./noteGenerator";
 // 注意: 不在主进程中直接 import 思维导图库（如 markmap-view、simple-mind-map）
 // 这些库在加载时会访问 document/window，而 Zotero Background 进程没有 DOM 环境
 // 改用 iframe 架构：在独立 HTML 页面中加载这些库
@@ -2345,13 +2346,17 @@ async function saveChatPairToNote(
   }
 
   const jsonMarker = `<!-- AI_BUTLER_CHAT_JSON: ${JSON.stringify({ id: pairId, user: userMessage, assistant: assistantMessage })} -->`;
+  
+  // 用户提问作为纯文本标题，AI 回复保留 Markdown 格式
+  const assistantHtml = NoteGenerator.convertMarkdownToNoteHTML(assistantMessage);
+  
   const block = `
 <!-- AI_BUTLER_CHAT_PAIR_START id=${escapeHtmlForNote(pairId)} -->
 ${jsonMarker}
 <div id="ai-butler-pair-${escapeHtmlForNote(pairId)}" style="margin-top:14px; padding-top:8px; border-top:1px dashed #ccc;">
-  <div style="background-color:#e3f2fd; padding:10px; border-radius:6px; margin-bottom:8px;"><strong>👤 用户:</strong> ${escapeHtmlForNote(userMessage)}</div>
-  <div style="background-color:#f5f5f5; padding:10px; border-radius:6px;"><strong>🤖 AI管家:</strong><br/>${escapeHtmlForNote(assistantMessage).replace(/\n/g, "<br/>")}</div>
-  <div style="font-size:11px; color:#999; margin-top:6px;">保存时间: ${new Date().toLocaleString("zh-CN")} (来自快速提问)</div>
+    <h2 style="margin: 0 0 8px 0;">${escapeHtmlForNote(userMessage)}</h2>
+    <div>${assistantHtml}</div>
+    <blockquote style="margin: 8px 0 0 0; color: #666; font-size: 11px;">保存时间: ${new Date().toLocaleString("zh-CN")} (来自快速提问)</blockquote>
 </div>
 <!-- AI_BUTLER_CHAT_PAIR_END id=${escapeHtmlForNote(pairId)} -->
 `;
