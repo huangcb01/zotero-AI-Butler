@@ -29,6 +29,14 @@ interface ChatState {
   savedPairIds: Set<string>; // 已保存的对话对 ID，防止重复保存
 }
 
+interface QuickChatPdfReference {
+  text: string;
+  page: number | null;
+  attachmentKey: string | null;
+  uri: string | null;
+  annotation?: any;
+}
+
 // 递增的对话对 ID 计数器
 let quickChatPairIdCounter = 0;
 
@@ -130,6 +138,449 @@ function safeSetQuickChatMarkdown(
   } catch {
     element.innerHTML = escapeHtmlForChat(markdown);
   }
+}
+
+function normalizeQuickChatSelectedText(text: string): string {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (normalized.length <= 3000) return normalized;
+  return `${normalized.slice(0, 3000)}\n...(已截断)`;
+}
+
+function getZoteroItemUriBase(item: any): string | null {
+  const itemKey = item?.key;
+  if (!itemKey) return null;
+
+  const libraryID = Number(item?.libraryID);
+  const userLibraryID = Number((Zotero as any)?.Libraries?.userLibraryID || 1);
+  if (Number.isFinite(libraryID) && libraryID > 0 && libraryID !== userLibraryID) {
+    return `groups/${libraryID}/items/${itemKey}`;
+  }
+  return `library/items/${itemKey}`;
+}
+
+function getQuickChatCitationAuthorLabel(item: Zotero.Item): string {
+  const creators = ((item as any).getCreators?.() as any[]) || [];
+  if (!creators.length) return "该文献";
+
+  const first = creators[0];
+  const firstName = first?.lastName || first?.name || "该文献";
+  return creators.length > 1 ? `${firstName} 等` : firstName;
+}
+
+function getQuickChatCitationYear(item: Zotero.Item): string {
+  const year = (item.getField("year") as string) || "";
+  if (year) return year;
+
+  const date = (item.getField("date") as string) || "";
+  const match = /(19|20)\d{2}/.exec(date);
+  return match?.[0] || "n.d.";
+}
+
+function buildQuickChatReferenceMarkdown(
+  item: Zotero.Item,
+  selectedReference: QuickChatPdfReference,
+): string {
+  const normalizedText = selectedReference.text
+    .replace(/\r\n/g, "\n")
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (!normalizedText) return "";
+
+  const quoteText = `“${normalizedText}”`;
+  const author = getQuickChatCitationAuthorLabel(item);
+  const year = getQuickChatCitationYear(item);
+  const pagePart = selectedReference.page ? `, p. ${selectedReference.page}` : "";
+
+  const selectUriBase = getZoteroItemUriBase(item);
+  const selectLink = selectUriBase
+    ? `[${author}, ${year}${pagePart}](zotero://select/${selectUriBase})`
+    : `${author}, ${year}${pagePart}`;
+
+  const pdfLink = selectedReference.uri
+    ? `([pdf](${selectedReference.uri}))`
+    : "";
+
+  return `${quoteText} (${selectLink}) ${pdfLink}`.trim();
+}
+
+function trySerializeAnnotationsNative(
+  annotations: any[],
+): { html: string; citationItems: any[] } | null {
+  try {
+    const utilities = (Zotero as any).EditorInstanceUtilities;
+    const staticSerialize = utilities?.serializeAnnotations;
+    if (typeof staticSerialize === "function") {
+      const result = staticSerialize.call(utilities, annotations, true);
+      const html = typeof result?.html === "string" ? result.html : "";
+      const citationItems = Array.isArray(result?.citationItems) ? result.citationItems : [];
+      if (html && citationItems.length) {
+        return { html, citationItems };
+      }
+      return null;
+    }
+
+    // 兼容旧路径（若 EditorInstanceUtilities 可实例化）
+    if (typeof utilities === "function") {
+      const instance = new utilities();
+      if (typeof instance?.serializeAnnotations === "function") {
+        const result = instance.serializeAnnotations(annotations, true);
+        const html = typeof result?.html === "string" ? result.html : "";
+        const citationItems = Array.isArray(result?.citationItems) ? result.citationItems : [];
+        if (html && citationItems.length) {
+          return { html, citationItems };
+        }
+      }
+    }
+  } catch (err) {
+    ztoolkit.log("[AI-Butler] 原生序列化调用失败:", err);
+  }
+  return null;
+}
+
+function buildQuickChatReferenceNative(
+  item: Zotero.Item,
+  selectedReference: QuickChatPdfReference | null,
+): { html: string; citationItems: any[] } {
+  if (!selectedReference) {
+    return { html: "", citationItems: [] };
+  }
+
+  if (selectedReference.annotation) {
+    const native = trySerializeAnnotationsNative([selectedReference.annotation]);
+    if (native) {
+      return native;
+    }
+    return buildCitationElementsFromReference(item, selectedReference);
+  } else {
+    // 无注释对象：尝试构造可序列化注释
+    return buildCitationElementsFromReference(item, selectedReference);
+  }
+}
+
+/**
+ * 从引用信息构造可被 Zotero 原生序列化的引用
+ */
+function buildCitationElementsFromReference(
+  item: Zotero.Item,
+  selectedReference: QuickChatPdfReference,
+): { html: string; citationItems: any[] } {
+  try {
+    const normalizedText = selectedReference.text
+      .replace(/\r\n/g, "\n")
+      .replace(/\s*\n\s*/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+    const attachmentItemID = resolveQuickChatAttachmentItemID(item, selectedReference);
+    const normalizedAttachmentItemID =
+      typeof attachmentItemID === "number" && Number.isFinite(attachmentItemID) && attachmentItemID > 0
+        ? attachmentItemID
+        : undefined;
+    const page = selectedReference.page || 1;
+
+    // 构造最小可用注释对象，关键字段是 attachmentItemID
+    const fakeAnnotation = {
+      id: `quick-${Date.now()}`,
+      attachmentItemID: normalizedAttachmentItemID,
+      type: "highlight",
+      text: normalizedText,
+      color: "#fff59d",
+      pageLabel: String(page),
+      position: {
+        pageIndex: page - 1,
+        rects: [[0, 0, 1, 1]],
+      },
+    };
+
+    // 用 Zotero 原生序列化，生成 data-annotation/data-citation
+    const native = trySerializeAnnotationsNative([fakeAnnotation]);
+    if (native) {
+      return native;
+    }
+
+    // 最终回退：返回空，交给 Markdown 引用链路，避免生成无效 {citation}
+    return { html: "", citationItems: [] };
+  } catch (err) {
+    ztoolkit.log("[AI-Butler] 生成引用元素失败:", err);
+    return { html: "", citationItems: [] };
+  }
+}
+
+function resolveQuickChatAttachmentItemID(
+  item: Zotero.Item,
+  selectedReference: QuickChatPdfReference,
+): number | null {
+  const annotationAttachmentID = Number((selectedReference.annotation as any)?.attachmentItemID);
+  if (Number.isFinite(annotationAttachmentID) && annotationAttachmentID > 0) {
+    return annotationAttachmentID;
+  }
+
+  const key = selectedReference.attachmentKey;
+  if (key) {
+    try {
+      const byLibraryKey = (Zotero as any).Items?.getByLibraryAndKey?.(item.libraryID, key);
+      const byLibraryKeyID = Number(byLibraryKey?.id);
+      if (Number.isFinite(byLibraryKeyID) && byLibraryKeyID > 0) {
+        return byLibraryKeyID;
+      }
+    } catch {
+      // ignore and continue fallback
+    }
+
+    try {
+      const parent = item.isAttachment?.() && (item as any).parentItem
+        ? (item as any).parentItem
+        : item;
+      const attachmentIDs: number[] = (parent as any).getAttachments?.() || [];
+      const attachments = (Zotero as any).Items?.get?.(attachmentIDs) || [];
+      const matched = attachments.find((att: any) => att?.key === key);
+      const matchedID = Number(matched?.id);
+      if (Number.isFinite(matchedID) && matchedID > 0) {
+        return matchedID;
+      }
+    } catch {
+      // ignore and continue fallback
+    }
+  }
+
+  if (item.isAttachment?.()) {
+    const itemID = Number(item.id);
+    if (Number.isFinite(itemID) && itemID > 0) {
+      return itemID;
+    }
+  }
+
+  return null;
+}
+
+function enrichAnnotationForSerialization(
+  annotation: any,
+  readerItem: any,
+): any {
+  if (!annotation) return null;
+
+  const page = Number(annotation?.pageLabel) || Number(annotation?.position?.pageIndex) + 1 || 1;
+  const readerItemID = Number(readerItem?.id);
+  const attachmentItemID = Number.isFinite(readerItemID) && readerItemID > 0
+    ? readerItemID
+    : Number(annotation?.attachmentItemID);
+
+  return {
+    ...annotation,
+    id: annotation?.id || `quick-${Date.now()}`,
+    attachmentItemID: Number.isFinite(attachmentItemID) && attachmentItemID > 0
+      ? attachmentItemID
+      : annotation?.attachmentItemID,
+    pageLabel: annotation?.pageLabel || String(page),
+    position: annotation?.position?.rects
+      ? annotation.position
+      : {
+          pageIndex: Number.isFinite(Number(annotation?.position?.pageIndex))
+            ? Number(annotation.position.pageIndex)
+            : Math.max(0, page - 1),
+          rects: [[0, 0, 1, 1]],
+          ...(annotation?.position?.nextPageRects
+            ? { nextPageRects: annotation.position.nextPageRects }
+            : {}),
+        },
+    type: annotation?.type || "highlight",
+    color: annotation?.color || "#fff59d",
+  };
+}
+
+function isReaderMatchedForItem(readerItem: any, item: Zotero.Item): boolean {
+  if (!readerItem || !item) return false;
+
+  const itemId = item.id;
+  const itemParentId = (item as any).parentItemID || null;
+  const readerItemId = readerItem.id;
+  const readerParentId = readerItem.parentItemID || null;
+
+  if (readerItemId === itemId) return true;
+  if (readerParentId && readerParentId === itemId) return true;
+  if (itemParentId && readerItemId === itemParentId) return true;
+  if (itemParentId && readerParentId && itemParentId === readerParentId) return true;
+
+  return false;
+}
+
+function tryGetReaderSelectionText(reader: any): string {
+  const readAttempts: Array<() => string> = [
+    () => reader?._iframeWindow?.getSelection?.()?.toString?.() || "",
+    () => reader?._iframeWindow?.document?.getSelection?.()?.toString?.() || "",
+    () => reader?._iframeWindow?.wrappedJSObject?.getSelection?.()?.toString?.() || "",
+    () => reader?._internalReader?._iframeWindow?.getSelection?.()?.toString?.() || "",
+    () =>
+      reader?._internalReader?._primaryView?._iframeWindow
+        ?.getSelection?.()
+        ?.toString?.() || "",
+  ];
+
+  for (const read of readAttempts) {
+    try {
+      const text = read();
+      if (text && text.trim()) {
+        return text.trim();
+      }
+    } catch {
+      // 尝试下一个读取路径
+    }
+  }
+  return "";
+}
+
+function tryGetSelectedAnnotationFromReader(reader: any): any | null {
+  try {
+    const internalReader = reader?._internalReader;
+    const selectedIDs: string[] = [
+      ...(internalReader?._state?.selectedAnnotationIDs || []),
+      ...(reader?._state?.selectedAnnotationIDs || []),
+    ].filter(Boolean);
+    if (!selectedIDs.length) return null;
+
+    const annotations = internalReader?._state?.annotations || reader?._state?.annotations || [];
+    if (!Array.isArray(annotations) || !annotations.length) return null;
+
+    const selected = annotations.find((a: any) => selectedIDs.includes(a?.id));
+    return selected || null;
+  } catch {
+    return null;
+  }
+}
+
+function tryBuildSelectionAnnotationFromReader(reader: any): any | null {
+  const internalReader = reader?._internalReader;
+  const viewCandidates = [
+    internalReader?._primaryView,
+    internalReader?._secondaryView,
+    internalReader,
+  ];
+
+  for (const view of viewCandidates) {
+    if (!view) continue;
+
+    try {
+      const selectionRanges = view?._selectionRanges;
+      const fromRanges = view?._getAnnotationFromSelectionRanges;
+      if (
+        Array.isArray(selectionRanges)
+        && selectionRanges.length
+        && typeof fromRanges === "function"
+      ) {
+        const annotation = fromRanges.call(view, selectionRanges, "highlight");
+        if (annotation?.text && annotation?.position) {
+          return annotation;
+        }
+      }
+    } catch {
+      // 尝试下一个路径
+    }
+
+    try {
+      const fromTextSelection = view?._getAnnotationFromTextSelection;
+      if (typeof fromTextSelection === "function") {
+        const annotation = fromTextSelection.call(view, "highlight");
+        if (annotation?.text && annotation?.position) {
+          return annotation;
+        }
+      }
+    } catch {
+      // 尝试下一个路径
+    }
+  }
+
+  return null;
+}
+
+function getReferencePageFromAnnotation(annotation: any): number | null {
+  if (!annotation) return null;
+
+  const pageLabelNum = Number(annotation.pageLabel);
+  if (Number.isFinite(pageLabelNum) && pageLabelNum > 0) {
+    return pageLabelNum;
+  }
+
+  const pageIndexNum = Number(annotation?.position?.pageIndex);
+  if (Number.isFinite(pageIndexNum) && pageIndexNum >= 0) {
+    return pageIndexNum + 1;
+  }
+
+  return null;
+}
+
+async function getQuickChatSelectedPdfReference(
+  item: Zotero.Item,
+): Promise<QuickChatPdfReference | null> {
+  try {
+    const readers = [
+      ...(((Zotero as any).Reader?._readers as any[]) || []),
+    ].sort((a, b) => {
+      const aFocused = Boolean(a?._iframeWindow?.document?.hasFocus?.());
+      const bFocused = Boolean(b?._iframeWindow?.document?.hasFocus?.());
+      return Number(bFocused) - Number(aFocused);
+    });
+
+    for (const reader of readers) {
+      const readerItem = reader?._item;
+      if (!isReaderMatchedForItem(readerItem, item)) continue;
+
+      const annotation =
+        tryGetSelectedAnnotationFromReader(reader)
+        || tryBuildSelectionAnnotationFromReader(reader);
+      if (annotation?.text) {
+        const normalizedAnnotation = enrichAnnotationForSerialization(annotation, readerItem);
+        const text = normalizeQuickChatSelectedText(String(normalizedAnnotation.text));
+        if (!text) continue;
+
+        const page = getReferencePageFromAnnotation(normalizedAnnotation);
+        const uriBase = getZoteroItemUriBase(readerItem);
+        const uri = uriBase
+          ? `zotero://open-pdf/${uriBase}${page ? `?page=${page}` : ""}`
+          : null;
+
+        return {
+          text,
+          page,
+          attachmentKey: readerItem?.key || null,
+          uri,
+          annotation: normalizedAnnotation,
+        };
+      }
+
+      const selectedText = tryGetReaderSelectionText(reader);
+      if (selectedText) {
+        const text = normalizeQuickChatSelectedText(selectedText);
+        const page = null;
+        const uriBase = getZoteroItemUriBase(readerItem);
+        const uri = uriBase
+          ? `zotero://open-pdf/${uriBase}${page ? `?page=${page}` : ""}`
+          : null;
+
+        const fallbackAnnotation = enrichAnnotationForSerialization(
+          {
+            text,
+            type: "highlight",
+            pageLabel: "1",
+            position: { pageIndex: 0, rects: [[0, 0, 1, 1]] },
+          },
+          readerItem,
+        );
+
+        return {
+          text,
+          page,
+          attachmentKey: readerItem?.key || null,
+          uri,
+          annotation: fallbackAnnotation,
+        };
+      }
+    }
+  } catch (err) {
+    ztoolkit.log("[AI-Butler] 获取 PDF 选中文本失败:", err);
+  }
+
+  return null;
 }
 
 /**
@@ -2125,6 +2576,8 @@ function renderChatArea(
     // 生成唯一对话对 ID
     quickChatPairIdCounter++;
     const pairId = `quick_${Date.now()}_${quickChatPairIdCounter}`;
+    const selectedReference = await getQuickChatSelectedPdfReference(item);
+    const selectedPdfText = selectedReference?.text || "";
 
     // 创建对话对容器
     const pairWrapper = doc.createElement("div");
@@ -2157,6 +2610,37 @@ function renderChatArea(
     safeSetQuickChatMarkdown(userContentDiv, question);
     userMsgDiv.appendChild(userTitle);
     userMsgDiv.appendChild(userContentDiv);
+
+    if (selectedPdfText) {
+      const quoteLabel = doc.createElement("div");
+      quoteLabel.textContent = selectedReference?.page
+        ? `📌 本轮已引用当前 PDF 选中文本（第 ${selectedReference.page} 页）`
+        : "📌 本轮已引用当前 PDF 选中文本";
+      quoteLabel.style.cssText = `
+        margin-top: 6px;
+        font-size: 11px;
+        color: #666;
+      `;
+
+      const quoteContent = doc.createElement("div");
+      quoteContent.style.cssText = `
+        margin-top: 4px;
+        padding: 6px 8px;
+        border-left: 2px solid rgba(102, 126, 234, 0.6);
+        background: rgba(102, 126, 234, 0.06);
+        border-radius: 4px;
+        color: #555;
+        font-size: 11px;
+        max-height: 80px;
+        overflow: auto;
+        white-space: pre-wrap;
+      `;
+      quoteContent.innerHTML = escapeHtmlForChat(selectedPdfText);
+
+      userMsgDiv.appendChild(quoteLabel);
+      userMsgDiv.appendChild(quoteContent);
+    }
+
     pairWrapper.appendChild(userMsgDiv);
 
     // 创建 AI 回复区域
@@ -2219,7 +2703,13 @@ function renderChatArea(
       safeSetQuickChatMarkdown(userContentDiv, question);
 
       // 快速提问的关键：每次只发送论文+当前问题，不累积历史
-      const conversationHistory = [{ role: "user", content: question }];
+      // 若 PDF 有选中文本，则仅在本轮附加为引用上下文
+      const questionWithReference = selectedPdfText
+        ? `请结合下方“当前 PDF 选中文本”回答用户问题。${selectedReference?.page ? `该选区位于 PDF 第 ${selectedReference.page} 页。` : ""}\n\n[当前 PDF 选中文本]\n${selectedPdfText}\n\n[用户问题]\n${question}`
+        : question;
+      const conversationHistory = [
+        { role: "user", content: questionWithReference },
+      ];
 
       let fullResponse = "";
       await LLMClient.chatWithRetry(
@@ -2255,7 +2745,13 @@ function renderChatArea(
         (saveBtn as HTMLButtonElement).disabled = true;
 
         try {
-          await saveChatPairToNote(item, pairId, question, fullResponse);
+          await saveChatPairToNote(
+            item,
+            pairId,
+            question,
+            fullResponse,
+            selectedReference,
+          );
           currentChatState.savedPairIds.add(pairId);
           saveBtn.textContent = "✅ 已保存";
           saveBtn.style.background = "#4caf50";
@@ -2326,12 +2822,14 @@ async function getOrCreateChatNote(item: Zotero.Item): Promise<Zotero.Item> {
     }
   }
 
-  // 创建新笔记
+  // 创建新笔记（按 Zotero 标准格式）
   const note = new Zotero.Item("note");
   note.libraryID = item.libraryID;
   note.parentID = item.id;
   const header = `<h2>AI 管家 - 后续追问 - ${escapeHtmlForNote(title)}</h2>`;
-  note.setNote(header);
+  // 用 Zotero 标准格式包装：data-citation-items 和 data-schema-version
+  const initialHtml = `<div data-citation-items="${encodeURIComponent(JSON.stringify([]))}" data-schema-version="9">${header}</div>`;
+  note.setNote(initialHtml);
   note.addTag("AI-Butler-Chat");
   await note.saveTx();
   return note;
@@ -2350,6 +2848,43 @@ function escapeHtmlForNote(text: string): string {
 }
 
 /**
+ * 从笔记 HTML 中提取 citationItems 元数据
+ */
+function extractCitationItemsFromNote(noteHtml: string): any[] {
+  try {
+    const containerMatch = /<div[^>]*data-citation-items="([^"]+)"/.exec(noteHtml);
+    if (!containerMatch || !containerMatch[1]) {
+      return [];
+    }
+    const encoded = containerMatch[1];
+    const decoded = decodeURIComponent(encoded);
+    const items = JSON.parse(decoded);
+    return Array.isArray(items) ? items : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 将 citationItems 合并（去重）
+ */
+function mergeCitationItems(existing: any[], newItems: any[]): any[] {
+  let merged = [...existing];
+  for (const newItem of newItems) {
+    const isDuplicate = merged.some(
+      (item) =>
+        Array.isArray(item.uris) &&
+        newItem.uris &&
+        item.uris.some((uri: string) => newItem.uris.includes(uri))
+    );
+    if (!isDuplicate) {
+      merged.push(newItem);
+    }
+  }
+  return merged;
+}
+
+/**
  * 将对话对保存到后续追问笔记
  */
 async function saveChatPairToNote(
@@ -2357,6 +2892,7 @@ async function saveChatPairToNote(
   pairId: string,
   userMessage: string,
   assistantMessage: string,
+  selectedReference: QuickChatPdfReference | null = null,
 ): Promise<void> {
   const note = await getOrCreateChatNote(item);
   let noteHtml = (note as any).getNote?.() || "";
@@ -2367,24 +2903,55 @@ async function saveChatPairToNote(
     return;
   }
 
-  const jsonMarker = `<!-- AI_BUTLER_CHAT_JSON: ${JSON.stringify({ id: pairId, user: userMessage, assistant: assistantMessage })} -->`;
-  
-  // 用户提问作为纯文本标题，AI 回复保留 Markdown 格式
+  const jsonMarker = `<!-- AI_BUTLER_CHAT_JSON: ${JSON.stringify({ id: pairId, user: userMessage, assistant: assistantMessage, reference: selectedReference })} -->`;
+
+  // 用户提问作为纯文本标题，引用内容优先使用 Zotero 原生注释序列化格式，失败时回退 Markdown
+  const { html: nativeReferenceHtml, citationItems: referenceCitationItems } =
+    buildQuickChatReferenceNative(item, selectedReference);
+  const referenceMarkdown = selectedReference
+    ? buildQuickChatReferenceMarkdown(item, selectedReference)
+    : "";
+  const referenceHtml = nativeReferenceHtml || (referenceMarkdown
+    ? NoteGenerator.convertMarkdownToNoteHTML(referenceMarkdown)
+    : "");
   const assistantHtml = NoteGenerator.convertMarkdownToNoteHTML(assistantMessage);
-  
+
   const block = `
 <!-- AI_BUTLER_CHAT_PAIR_START id=${escapeHtmlForNote(pairId)} -->
 ${jsonMarker}
 <div id="ai-butler-pair-${escapeHtmlForNote(pairId)}" style="margin-top:14px; padding-top:8px; border-top:1px dashed #ccc;">
     <h2 style="margin: 0 0 8px 0;">${escapeHtmlForNote(userMessage)}</h2>
+  ${referenceHtml ? `<div style="margin: 0 0 8px 0;">${referenceHtml}</div>` : ""}
     <div>${assistantHtml}</div>
     <blockquote style="margin: 8px 0 0 0; color: #666; font-size: 11px;">保存时间: ${new Date().toLocaleString("zh-CN")} (来自快速提问)</blockquote>
 </div>
 <!-- AI_BUTLER_CHAT_PAIR_END id=${escapeHtmlForNote(pairId)} -->
 `;
 
-  noteHtml += block;
-  (note as any).setNote(noteHtml);
+  // 提取现有的 citationItems（从 data-citation-items 属性）
+  let existingCitationItems = extractCitationItemsFromNote(noteHtml);
+
+  // 移除旧的笔记内容容器（保留内部内容，只去掉包装的 div）
+  let innerContent = noteHtml;
+  const containerMatch = /<div[^>]*data-citation-items="[^"]*"\s*data-schema-version="[^"]*">[\s\S]*<\/div>/.exec(
+    noteHtml
+  );
+  if (containerMatch) {
+    innerContent = noteHtml.substring(
+      containerMatch.index + containerMatch[0].indexOf(">") + 1,
+      containerMatch.index + containerMatch[0].lastIndexOf("</div>")
+    );
+  }
+
+  // 合并 citationItems
+  const allCitationItems = mergeCitationItems(existingCitationItems, referenceCitationItems);
+
+  // 生成最终的笔记内容：用 Zotero 标准格式包装
+  const citationItemsJson = encodeURIComponent(JSON.stringify(allCitationItems));
+  const schemaVersion = 9; // 使用 Zotero 的 schema version
+  const finalNoteHtml = `<div data-citation-items="${citationItemsJson}" data-schema-version="${schemaVersion}">${innerContent}${block}</div>`;
+
+  (note as any).setNote(finalNoteHtml);
   await (note as any).saveTx();
   ztoolkit.log("[AI-Butler] 快速提问对话已保存到笔记");
 }
