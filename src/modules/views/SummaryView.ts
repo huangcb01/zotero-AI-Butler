@@ -29,6 +29,14 @@ import { marked } from "marked";
 import { getPref } from "../../utils/prefs";
 import { createStyledButton } from "./ui/components";
 import katex from "katex";
+import {
+  LLMNoteMetadataService,
+  type LLMNoteMetadata,
+} from "../llmNoteMetadata";
+import {
+  buildFollowUpChatPairNoteHtml,
+  normalizeFollowUpChatNoteHtml,
+} from "../noteMarkdown";
 
 /**
  * AI 总结视图类
@@ -134,6 +142,7 @@ export class SummaryView extends BaseView {
         flexDirection: "column",
         height: "100%",
         width: "100%", // 明确宽度
+        minWidth: "0",
         overflow: "hidden", // 防止容器本身滚动
         fontFamily: "system-ui, -apple-system, sans-serif",
       },
@@ -164,6 +173,7 @@ export class SummaryView extends BaseView {
       styles: {
         flex: "1 1 0", // 关键:基准值为0,强制从 flex 分配获取高度
         minHeight: "0", // 允许 flex 项目缩小
+        minWidth: "0", // 允许长标题/Markdown 内容在视口内换行
         overflow: "hidden", // 外层不滚动
       },
     });
@@ -173,6 +183,7 @@ export class SummaryView extends BaseView {
       styles: {
         height: "100%", // 关键:明确设置100%高度
         width: "100%",
+        minWidth: "0",
         overflowY: "auto", // 启用纵向滚动
         overflowX: "hidden", // 禁止横向滚动
         boxSizing: "border-box",
@@ -184,6 +195,8 @@ export class SummaryView extends BaseView {
       styles: {
         padding: "0 20px 20px 20px",
         boxSizing: "border-box",
+        minWidth: "0",
+        maxWidth: "100%",
       },
     });
 
@@ -194,7 +207,10 @@ export class SummaryView extends BaseView {
         fontSize: "14px",
         lineHeight: "1.6",
         wordWrap: "break-word", // 确保长文本换行
-        overflowWrap: "break-word", // 兼容性换行
+        overflowWrap: "anywhere", // 兼容性换行
+        wordBreak: "break-word",
+        minWidth: "0",
+        maxWidth: "100%",
         userSelect: "text", // 确保文本可以被选择
         cursor: "text", // 鼠标样式提示可选择
       },
@@ -330,6 +346,7 @@ export class SummaryView extends BaseView {
         borderTop: "1px solid var(--ai-border)",
         backgroundColor: "var(--ai-surface-2)",
         flexShrink: "0",
+        minWidth: "0",
       },
     });
 
@@ -485,6 +502,8 @@ export class SummaryView extends BaseView {
           border: "1px solid var(--ai-border)",
           borderRadius: "10px",
           backgroundColor: "var(--ai-surface-2)",
+          minWidth: "0",
+          maxWidth: "100%",
         },
       });
       (pairContainer as any).setAttribute("data-pair-id", pairId);
@@ -554,16 +573,27 @@ export class SummaryView extends BaseView {
     }
 
     try {
-      // 导入 LLMClient
-      const { default: LLMClient } = await import("../llmClient");
+      const { default: LLMService } = await import("../llmService");
 
-      // 调用chat方法 (使用带重试的方法，支持 API 密钥轮换)
       let fullResponse = "";
-      await LLMClient.chatWithRetry(
-        this.currentPdfContent,
-        this.currentIsBase64,
-        this.conversationHistory,
-        (chunk: string) => {
+      let responseMetadata: LLMNoteMetadata | null = null;
+      const response = await LLMService.chat({
+        content: {
+          kind: "legacy",
+          content: this.currentPdfContent,
+          isBase64: this.currentIsBase64,
+          policy: this.currentIsBase64 ? "pdf-base64" : "text",
+        },
+        conversation: this.conversationHistory.map((message) => ({
+          role:
+            message.role === "assistant"
+              ? "assistant"
+              : message.role === "system"
+                ? "system"
+                : "user",
+          content: message.content,
+        })),
+        onProgress: (chunk: string) => {
           fullResponse += chunk;
           // 更新助手消息显示
           if (assistantMessageContainer) {
@@ -578,7 +608,18 @@ export class SummaryView extends BaseView {
           // 自动滚动
           this.scrollToBottom();
         },
-      );
+      });
+      fullResponse = response.text;
+      responseMetadata = LLMNoteMetadataService.fromResponse("chat", response);
+      if (assistantMessageContainer) {
+        const contentDiv = assistantMessageContainer.querySelector(
+          ".chat-message-content",
+        ) as HTMLElement;
+        if (contentDiv) {
+          contentDiv.innerHTML =
+            SummaryView.convertMarkdownToHTMLCore(fullResponse);
+        }
+      }
 
       // 添加助手回复到历史
       this.conversationHistory.push({
@@ -599,6 +640,7 @@ export class SummaryView extends BaseView {
           pairId,
           userMessage,
           fullResponse,
+          responseMetadata,
         );
       }
     } catch (error: any) {
@@ -640,6 +682,8 @@ export class SummaryView extends BaseView {
         padding: "12px",
         borderRadius: "8px",
         borderLeft: `4px solid var(--ai-accent)`,
+        minWidth: "0",
+        maxWidth: "100%",
       },
     });
 
@@ -657,6 +701,10 @@ export class SummaryView extends BaseView {
       styles: {
         fontSize: "14px",
         lineHeight: "1.6",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
+        minWidth: "0",
+        maxWidth: "100%",
         userSelect: "text", // 确保文本可以被选择
         cursor: "text", // 鼠标样式提示可选择
       },
@@ -706,13 +754,7 @@ export class SummaryView extends BaseView {
     return `pair_${Date.now()}_${this.pairIdCounter}`;
   }
 
-  /**
-   * 获取或创建“AI管家-后续追问-论文名”独立笔记
-   */
-  private async getOrCreateChatNote(item: Zotero.Item): Promise<Zotero.Item> {
-    const title = (item.getField("title") as string) || "文献";
-
-    // 查找已有的聊天笔记：条件为包含我们约定的标题标识或带有专属标签
+  private async findChatNote(item: Zotero.Item): Promise<Zotero.Item | null> {
     const noteIDs = (item as any).getNotes?.() || [];
     for (const nid of noteIDs) {
       try {
@@ -729,6 +771,18 @@ export class SummaryView extends BaseView {
         continue;
       }
     }
+
+    return null;
+  }
+
+  /**
+   * 获取或创建“AI管家-后续追问-论文名”独立笔记
+   */
+  private async getOrCreateChatNote(item: Zotero.Item): Promise<Zotero.Item> {
+    const existingNote = await this.findChatNote(item);
+    if (existingNote) return existingNote;
+
+    const title = (item.getField("title") as string) || "文献";
 
     // 创建新笔记
     const note = new Zotero.Item("note");
@@ -748,25 +802,24 @@ export class SummaryView extends BaseView {
     pairId: string,
     userMessage: string,
     assistantMessage: string,
+    metadata?: LLMNoteMetadata | null,
   ): Promise<void> {
     if (!this.currentItemId) return;
     try {
       const item = await Zotero.Items.getAsync(this.currentItemId);
       if (!item) return;
       const note = await this.getOrCreateChatNote(item);
-      let noteHtml = (note as any).getNote?.() || "";
-
-      const jsonMarker = `<!-- AI_BUTLER_CHAT_JSON: ${JSON.stringify({ id: pairId, user: userMessage, assistant: assistantMessage })} -->`;
-      const block = `
-<!-- AI_BUTLER_CHAT_PAIR_START id=${this.escapeHtml(pairId)} -->
-${jsonMarker}
-<div id="ai-butler-pair-${this.escapeHtml(pairId)}" style="margin-top:14px; padding-top:8px; border-top:1px dashed #ccc;">
-  <div style="background-color:#e3f2fd; padding:10px; border-radius:6px; margin-bottom:8px;"><strong>👤 用户:</strong> ${this.escapeHtml(userMessage)}</div>
-  <div style="background-color:#f5f5f5; padding:10px; border-radius:6px;"><strong>🤖 AI管家:</strong><br/>${SummaryView.convertMarkdownToHTMLCore(assistantMessage)}</div>
-  <div style="font-size:11px; color:#999; margin-top:6px;">保存时间: ${new Date().toLocaleString("zh-CN")}</div>
-</div>
-<!-- AI_BUTLER_CHAT_PAIR_END id=${this.escapeHtml(pairId)} -->
-`;
+      let noteHtml = normalizeFollowUpChatNoteHtml(
+        (note as any).getNote?.() || "",
+      );
+      const blockContent = buildFollowUpChatPairNoteHtml({
+        pairId,
+        userMessage,
+        assistantMessage,
+      });
+      const block = metadata
+        ? LLMNoteMetadataService.wrapHtml(blockContent, metadata)
+        : blockContent;
 
       noteHtml += block;
       (note as any).setNote(noteHtml);
@@ -785,7 +838,8 @@ ${jsonMarker}
     try {
       const item = await Zotero.Items.getAsync(this.currentItemId);
       if (!item) return;
-      const note = await this.getOrCreateChatNote(item);
+      const note = await this.findChatNote(item);
+      if (!note) return;
       let noteHtml = (note as any).getNote?.() || "";
 
       // 使用标记区间删除
@@ -819,6 +873,8 @@ ${jsonMarker}
         border: "1px solid var(--ai-border)",
         borderRadius: "10px",
         backgroundColor: "var(--ai-surface-2)",
+        minWidth: "0",
+        maxWidth: "100%",
       },
     });
 
@@ -829,12 +885,14 @@ ${jsonMarker}
         alignItems: "center",
         gap: "8px",
         padding: "6px 2px 4px 2px",
+        minWidth: "0",
       },
     });
     const titleEl = this.createElement("div", {
       styles: {
         fontWeight: "600",
         color: "var(--ai-accent)",
+        flexShrink: "0",
       },
       textContent: "📘 AI管家笔记",
     });
@@ -848,6 +906,7 @@ ${jsonMarker}
         whiteSpace: "nowrap",
         overflow: "hidden",
         textOverflow: "ellipsis",
+        minWidth: "0",
       },
       textContent: previewText
         ? `摘要：${previewText}${aiSummary.length > 100 ? "…" : ""}`
@@ -1364,7 +1423,8 @@ ${jsonMarker}
    */
   private async loadExistingChatPairs(item: Zotero.Item): Promise<void> {
     try {
-      const note = await this.getOrCreateChatNote(item);
+      const note = await this.findChatNote(item);
+      if (!note) return;
       const html: string = (note as any).getNote?.() || "";
       // 提取 JSON 标记
       const regex = /<!--\s*AI_BUTLER_CHAT_JSON:\s*(\{[\s\S]*?\})\s*-->/g;
@@ -1889,6 +1949,8 @@ ${jsonMarker}
         marginBottom: "30px",
         paddingBottom: "20px",
         borderBottom: "1px solid rgba(89, 192, 188, 0.2)",
+        minWidth: "0",
+        maxWidth: "100%",
       },
     });
 
@@ -1898,6 +1960,8 @@ ${jsonMarker}
         color: "var(--ai-accent)",
         marginBottom: "15px",
         fontSize: "16px",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
       },
       textContent: itemTitle,
     });
@@ -1908,6 +1972,10 @@ ${jsonMarker}
       styles: {
         whiteSpace: "pre-wrap",
         wordWrap: "break-word",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
+        minWidth: "0",
+        maxWidth: "100%",
         userSelect: "text", // 确保文本可以被选择
         cursor: "text", // 鼠标样式提示可选择
       },
@@ -1988,11 +2056,41 @@ ${jsonMarker}
    * @param itemTitle 条目标题
    * @param errorMessage 错误消息
    */
-  public showError(itemTitle: string, errorMessage: string): void {
+  public showError(
+    itemTitle: string,
+    errorMessage: string,
+    errorDetails?: string,
+  ): void {
     if (!this.outputContainer) return;
 
     // 隐藏加载状态(如果存在)
     this.hideLoading();
+
+    const copyText =
+      errorDetails ||
+      [
+        "AI-Butler summary error",
+        `generatedAt: ${new Date().toISOString()}`,
+        `title: ${itemTitle}`,
+        `errorMessage: ${errorMessage}`,
+      ].join("\n");
+
+    const copyButton = this.createElement("button", {
+      styles: {
+        padding: "6px 12px",
+        border: "1px solid #777",
+        borderRadius: "4px",
+        backgroundColor: "transparent",
+        color: "#777",
+        cursor: "pointer",
+        fontSize: "12px",
+        marginTop: "10px",
+      },
+      textContent: "复制错误",
+    });
+    copyButton.addEventListener("click", () => {
+      void this.copyErrorToClipboard(copyText);
+    });
 
     const errorContainer = this.createElement("div", {
       className: "item-output error",
@@ -2020,6 +2118,7 @@ ${jsonMarker}
           },
           textContent: `错误: ${errorMessage}`,
         }),
+        copyButton,
       ],
     });
 
@@ -2029,6 +2128,50 @@ ${jsonMarker}
     this.applyTheme();
 
     this.scrollToBottom();
+  }
+
+  private async copyErrorToClipboard(text: string): Promise<void> {
+    const win = Zotero.getMainWindow();
+    const document = win.document;
+    const clipboard = win.navigator?.clipboard;
+
+    try {
+      if (clipboard?.writeText) {
+        await clipboard.writeText(text);
+      } else {
+        throw new Error("clipboard api unavailable");
+      }
+    } catch {
+      try {
+        const host = document.body || document.documentElement;
+        if (!host) {
+          throw new Error("document host unavailable");
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        Object.assign(textarea.style, {
+          position: "fixed",
+          left: "-9999px",
+          top: "0",
+        });
+        host.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+      } catch {
+        new ztoolkit.ProgressWindow("AI Butler", { closeTime: 2200 })
+          .createLine({
+            text: "复制失败，可手动选择错误文本",
+            type: "fail",
+          })
+          .show();
+        return;
+      }
+    }
+
+    new ztoolkit.ProgressWindow("AI Butler", { closeTime: 1500 })
+      .createLine({ text: "已复制错误详情", type: "success" })
+      .show();
   }
 
   /**

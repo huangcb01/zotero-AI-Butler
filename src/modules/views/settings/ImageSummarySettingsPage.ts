@@ -29,6 +29,7 @@ import { ImageClient, ImageGenerationError } from "../../imageClient";
  */
 export class ImageSummarySettingsPage {
   private container: HTMLElement;
+  private endpointPreviewUpdaters: Array<() => void> = [];
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -39,6 +40,7 @@ export class ImageSummarySettingsPage {
    */
   public render(): void {
     this.container.innerHTML = "";
+    this.endpointPreviewUpdaters = [];
 
     // 标题
     const title = this.createElement("h2", {
@@ -90,13 +92,16 @@ export class ImageSummarySettingsPage {
         const isDefaultGemini =
           !cur || cur === "https://generativelanguage.googleapis.com";
         const isDefaultOpenAI =
-          cur === "https://api.openai.com/v1/chat/completions";
+          cur === "https://api.openai.com/v1/chat/completions" ||
+          cur === "https://api.openai.com/v1/responses" ||
+          cur === "https://api.openai.com/v1/images/generations";
         if (newVal === "openai" && isDefaultGemini) {
-          urlInput.value = "https://api.openai.com/v1/chat/completions";
+          urlInput.value = "https://api.openai.com/v1/images/generations";
         }
         if (newVal === "gemini" && (isDefaultOpenAI || !cur)) {
           urlInput.value = "https://generativelanguage.googleapis.com";
         }
+        this.refreshEndpointPreviews();
       },
     );
     form.appendChild(
@@ -122,20 +127,30 @@ export class ImageSummarySettingsPage {
 
     // API Base URL
     form.appendChild(
+      this.createEndpointFormGroup(
+        "API 地址 *",
+        "imageSummaryApiUrl",
+        (getPref("imageSummaryApiUrl" as any) as string) ||
+          (requestModeValue === "openai"
+            ? "https://api.openai.com/v1/images/generations"
+            : "https://generativelanguage.googleapis.com"),
+        requestModeValue === "openai"
+          ? "https://api.openai.com/v1/images/generations"
+          : "https://generativelanguage.googleapis.com",
+      ),
+    );
+
+    // 自定义请求 Header
+    form.appendChild(
       createFormGroup(
-        "API 基础地址",
-        createInput(
-          "imageSummaryApiUrl",
-          "text",
-          (getPref("imageSummaryApiUrl" as any) as string) ||
-            (requestModeValue === "openai"
-              ? "https://api.openai.com/v1/chat/completions"
-              : "https://generativelanguage.googleapis.com"),
-          requestModeValue === "openai"
-            ? "https://api.openai.com/v1/chat/completions"
-            : "https://generativelanguage.googleapis.com",
+        "额外请求 Headers",
+        createTextarea(
+          "imageSummaryCustomHeaders",
+          (getPref("imageSummaryCustomHeaders" as any) as string) || "",
+          4,
+          '{"X-ModelScope-Async-Mode": "true"}',
         ),
-        "Gemini: 填基础地址；OpenAI: 可填基础地址或完整端点（如 /v1/chat/completions）",
+        '可选。填写 JSON 或 Python dict 对象，键值会附加到一图总结生图请求；例如 {"X-ModelScope-Async-Mode": "true"}。鉴权和 Content-Type 仍由插件配置管理。',
       ),
     );
 
@@ -150,7 +165,23 @@ export class ImageSummarySettingsPage {
             "gemini-3-pro-image-preview",
           "gemini-3-pro-image-preview",
         ),
-        "Gemini 生图模型名称，推荐使用 gemini-3-pro-image-preview (Nano Banana Pro)",
+        "Gemini 推荐 gemini-3-pro-image-preview；OpenAI 兼容生图可填写 gpt-image-2 等模型",
+      ),
+    );
+
+    const timeoutInput = createInput(
+      "imageSummaryRequestTimeoutSeconds",
+      "number",
+      String(ImageClient.getImageSummaryRequestTimeoutSeconds()),
+      "600",
+    );
+    timeoutInput.min = "30";
+    timeoutInput.step = "1";
+    form.appendChild(
+      createFormGroup(
+        "生图请求超时时间 (秒)",
+        timeoutInput,
+        "一图总结第二阶段生图请求的超时时间，默认 600 秒 (10 分钟)，最小 30 秒。",
       ),
     );
 
@@ -180,7 +211,7 @@ export class ImageSummarySettingsPage {
           (getPref("imageSummaryAspectRatioEnabled" as any) as boolean) ??
             false,
         ),
-        "是否在 API 请求中包含宽高比参数（关闭此选项可兼容不支持该参数的 API 代理）",
+        "Gemini 模式发送 aspectRatio；OpenAI/gpt-image-2 模式会和分辨率一起合成为官方 size 参数。",
       ),
     );
 
@@ -194,7 +225,7 @@ export class ImageSummarySettingsPage {
           (getPref("imageSummaryAspectRatio" as any) as string) || "16:9",
           "16:9",
         ),
-        "生成图片的宽高比，如 16:9、1:1、9:16、4:3 等",
+        "生成图片的宽高比，如 16:9、1:1、9:16、4:3 等；gpt-image-2 的最长边/最短边比例需不超过 3:1。",
       ),
     );
 
@@ -206,7 +237,7 @@ export class ImageSummarySettingsPage {
           "imageSummaryResolutionEnabled",
           (getPref("imageSummaryResolutionEnabled" as any) as boolean) ?? false,
         ),
-        "是否在 API 请求中包含分辨率参数（关闭此选项可兼容不支持该参数的 API 代理）",
+        "Gemini 模式发送 imageSize；OpenAI/gpt-image-2 模式会转换为官方 size 参数。",
       ),
     );
 
@@ -223,7 +254,7 @@ export class ImageSummarySettingsPage {
           ],
           (getPref("imageSummaryResolution" as any) as string) || "1K",
         ),
-        "生成图片的分辨率，更高分辨率可能会增加 API 费用",
+        "生成图片的分辨率；OpenAI/gpt-image-2 会映射为合法尺寸，如 16:9 的 1K/2K/4K 对应 1280x720、2048x1152、3840x2160。",
       ),
     );
 
@@ -488,6 +519,7 @@ export class ImageSummarySettingsPage {
         "imageSummaryModel",
         "imageSummaryLanguage",
         "imageSummaryAspectRatio",
+        "imageSummaryCustomHeaders",
         "imageSummaryPrompt",
         "imageSummaryImagePrompt",
       ];
@@ -499,6 +531,20 @@ export class ImageSummarySettingsPage {
         if (input) {
           setPref(field as any, input.value.trim() as any);
         }
+      }
+
+      const timeoutInput = this.container.querySelector(
+        "#setting-imageSummaryRequestTimeoutSeconds",
+      ) as HTMLInputElement | null;
+      if (timeoutInput) {
+        const timeoutSeconds = ImageClient.getImageSummaryRequestTimeoutSeconds(
+          timeoutInput.value,
+        );
+        timeoutInput.value = String(timeoutSeconds);
+        setPref(
+          "imageSummaryRequestTimeoutSeconds" as any,
+          String(timeoutSeconds),
+        );
       }
 
       // 下拉框单独处理 (requestMode)
@@ -610,6 +656,19 @@ export class ImageSummarySettingsPage {
           "#setting-imageSummaryModel",
         ) as HTMLInputElement
       )?.value?.trim() || "gemini-3-pro-image-preview";
+    const customHeaders =
+      (
+        this.container.querySelector(
+          "#setting-imageSummaryCustomHeaders",
+        ) as HTMLTextAreaElement
+      )?.value?.trim() || "";
+    const requestTimeoutMs = ImageClient.getImageSummaryRequestTimeoutMs(
+      (
+        this.container.querySelector(
+          "#setting-imageSummaryRequestTimeoutSeconds",
+        ) as HTMLInputElement | null
+      )?.value,
+    );
 
     // 页面内结果区域
     const resultBox = this.container.querySelector(
@@ -647,6 +706,8 @@ export class ImageSummarySettingsPage {
           apiUrl,
           model,
           requestMode: requestMode as any,
+          customHeaders,
+          requestTimeoutMs,
         },
       );
 
@@ -737,6 +798,172 @@ export class ImageSummarySettingsPage {
       Object.assign(el.style, options.styles);
     }
     return el;
+  }
+
+  private createEndpointFormGroup(
+    label: string,
+    id: string,
+    value: string,
+    placeholder: string,
+  ): HTMLElement {
+    const doc = this.container.ownerDocument || Zotero.getMainWindow().document;
+    const group = doc.createElement("div");
+    Object.assign(group.style, { marginBottom: "24px" });
+
+    const labelRow = doc.createElement("div");
+    Object.assign(labelRow.style, {
+      display: "flex",
+      alignItems: "center",
+      gap: "10px",
+      marginBottom: "8px",
+      width: "100%",
+    });
+
+    const labelEl = doc.createElement("label");
+    labelEl.textContent = label;
+    Object.assign(labelEl.style, {
+      fontSize: "14px",
+      fontWeight: "600",
+      color: "var(--ai-text)",
+    });
+
+    const official = this.createEndpointMeta("官方 Endpoint：");
+    official.style.marginLeft = "auto";
+    labelRow.appendChild(labelEl);
+    labelRow.appendChild(official);
+
+    const input = createInput(id, "text", value, placeholder);
+    group.appendChild(labelRow);
+    group.appendChild(input);
+
+    const desc = doc.createElement("div");
+    Object.assign(desc.style, {
+      marginTop: "6px",
+      display: "flex",
+      alignItems: "center",
+      gap: "6px",
+      fontSize: "12px",
+      color: "var(--ai-text-muted)",
+    });
+
+    const required = doc.createElement("span");
+    required.textContent = "【必填】";
+    required.style.flex = "0 0 auto";
+
+    const preview = this.createEndpointMeta("预览：");
+    preview.style.maxWidth = "440px";
+
+    desc.appendChild(required);
+    desc.appendChild(preview);
+    group.appendChild(desc);
+
+    const update = () => {
+      const endpoint = this.buildImageEndpointPreview(id, placeholder);
+      const officialEndpoint = this.getImageOfficialEndpoint();
+      official.textContent = `官方 Endpoint：${officialEndpoint}`;
+      official.title = officialEndpoint;
+      preview.textContent = `预览：${endpoint}`;
+      preview.title = endpoint;
+    };
+
+    input.addEventListener("input", update);
+    input.addEventListener("change", update);
+    this.endpointPreviewUpdaters.push(update);
+
+    setTimeout(() => {
+      const modelInput = this.container.querySelector(
+        "#setting-imageSummaryModel",
+      ) as HTMLInputElement | null;
+      modelInput?.addEventListener("input", update);
+      modelInput?.addEventListener("change", update);
+      update();
+    }, 0);
+
+    return group;
+  }
+
+  private createEndpointMeta(text: string): HTMLElement {
+    const doc = this.container.ownerDocument || Zotero.getMainWindow().document;
+    const el = doc.createElement("span");
+    el.textContent = text;
+    Object.assign(el.style, {
+      display: "block",
+      minWidth: "0",
+      maxWidth: "520px",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap",
+      fontSize: "12px",
+      color: "var(--ai-text-muted)",
+    });
+    return el;
+  }
+
+  private refreshEndpointPreviews(): void {
+    setTimeout(() => {
+      this.endpointPreviewUpdaters.forEach((update) => update());
+    }, 0);
+  }
+
+  private buildImageEndpointPreview(urlInputId: string, fallbackUrl: string) {
+    const mode = this.getImageRequestMode();
+    const input = this.container.querySelector(
+      `#setting-${urlInputId}`,
+    ) as HTMLInputElement | null;
+    const rawUrl = (
+      input?.value ||
+      fallbackUrl ||
+      (mode === "openai"
+        ? "https://api.openai.com/v1/images/generations"
+        : "https://generativelanguage.googleapis.com")
+    )
+      .trim()
+      .replace(/\/+$/, "");
+    const model =
+      (
+        this.container.querySelector(
+          "#setting-imageSummaryModel",
+        ) as HTMLInputElement | null
+      )?.value?.trim() || "gemini-3-pro-image-preview";
+
+    if (mode === "openai") {
+      return this.toOpenAIImageEndpoint(rawUrl);
+    }
+
+    const base = rawUrl.replace(/\/v1beta(?:\/.*)?$/i, "");
+    return `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  }
+
+  private getImageOfficialEndpoint(): string {
+    if (this.getImageRequestMode() === "openai") {
+      return "https://api.openai.com/v1/images/generations";
+    }
+    return "https://generativelanguage.googleapis.com";
+  }
+
+  private getImageRequestMode(): "gemini" | "openai" {
+    const modeEl = this.container.querySelector(
+      "#setting-imageSummaryRequestMode",
+    ) as HTMLElement | null;
+    const value =
+      (modeEl as any)?.getValue?.() ||
+      modeEl?.getAttribute("data-value") ||
+      "gemini";
+    return value === "openai" ? "openai" : "gemini";
+  }
+
+  private toOpenAIImageEndpoint(url: string): string {
+    const raw = url.trim().replace(/\/+$/, "");
+    if (!raw) return "";
+    if (
+      /(\/v1\/(chat\/completions|responses|images\/generations)\b|\/(chat\/completions|responses|images\/generations)\b)/i.test(
+        raw,
+      )
+    ) {
+      return raw;
+    }
+    if (/\/v1$/i.test(raw)) return `${raw}/images/generations`;
+    return `${raw}/v1/images/generations`;
   }
 
   /**

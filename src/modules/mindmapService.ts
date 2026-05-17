@@ -13,7 +13,12 @@
  */
 
 import { PDFExtractor } from "./pdfExtractor";
-import { LLMClient } from "./llmClient";
+import LLMService from "./llmService";
+import {
+  LLMNoteMetadataService,
+  type LLMNoteMetadata,
+} from "./llmNoteMetadata";
+import type { LLMResponse } from "./llmproviders/types";
 import { getPref } from "../utils/prefs";
 import { getDefaultMindmapPrompt } from "../utils/prompts";
 
@@ -72,16 +77,11 @@ export class MindmapService {
         }
       }
 
-      const { pdfContent, isBase64 } = await this.extractPdfContent(item);
-
       // ========== 阶段 2: 生成思维导图 Markdown ==========
       progressCallback?.("generating", "正在生成思维导图...", 40);
 
-      const mindmapMarkdown = await this.generateMindmapMarkdown(
-        pdfContent,
-        isBase64,
-        itemTitle,
-      );
+      const mindmapResult = await this.generateMindmapMarkdown(item, itemTitle);
+      const mindmapMarkdown = mindmapResult.markdown;
 
       ztoolkit.log(
         `[AI-Butler] 思维导图生成完成，长度: ${mindmapMarkdown.length}`,
@@ -90,7 +90,11 @@ export class MindmapService {
       // ========== 阶段 3: 保存笔记 ==========
       progressCallback?.("saving", "正在保存思维导图笔记...", 80);
 
-      const note = await this.createMindmapNote(item, mindmapMarkdown);
+      const note = await this.createMindmapNote(
+        item,
+        mindmapMarkdown,
+        LLMNoteMetadataService.fromResponse("mindmap", mindmapResult.response),
+      );
 
       progressCallback?.("completed", "思维导图生成完成！", 100);
 
@@ -105,42 +109,27 @@ export class MindmapService {
   }
 
   /**
-   * 提取 PDF 内容
-   */
-  private static async extractPdfContent(
-    item: Zotero.Item,
-  ): Promise<{ pdfContent: string; isBase64: boolean }> {
-    const prefMode = (getPref("pdfProcessMode") as string) || "base64";
-
-    if (prefMode === "base64") {
-      const pdfContent = await PDFExtractor.extractBase64FromItem(item);
-      return { pdfContent, isBase64: true };
-    } else {
-      const fullText = await PDFExtractor.extractTextFromItem(item);
-      const cleanedText = PDFExtractor.cleanText(fullText);
-      const pdfContent = PDFExtractor.truncateText(cleanedText);
-      return { pdfContent, isBase64: false };
-    }
-  }
-
-  /**
    * 生成思维导图 Markdown
    */
   private static async generateMindmapMarkdown(
-    pdfContent: string,
-    isBase64: boolean,
+    item: Zotero.Item,
     itemTitle: string,
-  ): Promise<string> {
+  ): Promise<{ markdown: string; response: LLMResponse }> {
     // 获取思维导图提示词
     const prompt =
       (getPref("mindmapPrompt" as any) as string) || getDefaultMindmapPrompt();
 
     // 调用 LLM 生成思维导图 Markdown
-    const mindmapContent = await LLMClient.generateSummaryWithRetry(
-      pdfContent,
-      isBase64,
+    const response = await LLMService.generate({
+      task: "mindmap",
       prompt,
-    );
+      content: {
+        kind: "zotero-item",
+        item,
+      },
+      output: { format: "markdown" },
+    });
+    const mindmapContent = response.text;
 
     // 校验返回内容是否有效
     const trimmedContent = mindmapContent.trim();
@@ -148,8 +137,8 @@ export class MindmapService {
       const errorInfo = this.buildErrorDebugInfo(
         "空内容",
         mindmapContent,
-        pdfContent,
-        isBase64,
+        itemTitle,
+        false,
         prompt,
       );
       throw new Error(`LLM 返回了空内容，无法生成思维导图\n\n${errorInfo}`);
@@ -161,8 +150,8 @@ export class MindmapService {
       const errorInfo = this.buildErrorDebugInfo(
         "格式不符",
         mindmapContent,
-        pdfContent,
-        isBase64,
+        itemTitle,
+        false,
         prompt,
       );
       ztoolkit.log(
@@ -174,7 +163,7 @@ export class MindmapService {
       );
     }
 
-    return mindmapContent;
+    return { markdown: mindmapContent, response };
   }
 
   /**
@@ -231,6 +220,7 @@ ${truncatedRequest}`;
   private static async createMindmapNote(
     item: Zotero.Item,
     mindmapMarkdown: string,
+    metadata?: LLMNoteMetadata | null,
   ): Promise<Zotero.Item> {
     // 查找并删除已有的思维导图笔记
     const existingNote = await this.findExistingMindmapNote(item);
@@ -253,10 +243,13 @@ ${truncatedRequest}`;
 
     // 构建笔记 HTML
     // 使用 <pre> 标签保留格式，但不转义内部内容以便侧边栏解析
-    const noteHtml = `<h2>${this.escapeHtml(noteTitle)}</h2>
+    const noteHtmlRaw = `<h2>${this.escapeHtml(noteTitle)}</h2>
 <div data-schema-version="8">
 <pre>${wrappedContent}</pre>
 </div>`;
+    const noteHtml = metadata
+      ? LLMNoteMetadataService.wrapHtml(noteHtmlRaw, metadata)
+      : noteHtmlRaw;
 
     // 创建新笔记
     const note = new Zotero.Item("note");
@@ -277,7 +270,7 @@ ${truncatedRequest}`;
   /**
    * 查找已有的思维导图笔记
    */
-  private static async findExistingMindmapNote(
+  public static async findExistingMindmapNote(
     item: Zotero.Item,
   ): Promise<Zotero.Item | null> {
     const noteIds = item.getNotes();
@@ -294,7 +287,7 @@ ${truncatedRequest}`;
 
       // 也检查笔记标题
       const noteHtml: string = (note as any).getNote?.() || "";
-      if (noteHtml.includes("AI管家思维导图 -")) {
+      if (/<h2>\s*AI\s*管家思维导图\s*-/.test(noteHtml)) {
         return note;
       }
     }

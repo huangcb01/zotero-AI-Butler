@@ -37,16 +37,26 @@ pref(
 );
 pref("__prefsPrefix__.volcanoArkApiKey", "");
 pref("__prefsPrefix__.volcanoArkModel", "doubao-seed-1-8-251228");
+pref("__prefsPrefix__.ollamaApiUrl", "http://localhost:11434");
+pref("__prefsPrefix__.ollamaApiKey", "");
+pref("__prefsPrefix__.ollamaModel", "llama3.2");
+pref("__prefsPrefix__.llmEndpoints", "[]");
+pref("__prefsPrefix__.llmRoutingStrategy", "priority");
+pref("__prefsPrefix__.llmRoundRobinCursor", "");
+pref("__prefsPrefix__.multiModelSummaryEnabled", false);
+pref("__prefsPrefix__.multiModelSummaryEndpointIds", "[]");
 pref("__prefsPrefix__.temperature", "0.7");
 pref("__prefsPrefix__.enableTemperature", true);
 pref("__prefsPrefix__.maxTokens", "8192");
 pref("__prefsPrefix__.enableMaxTokens", true);
 pref("__prefsPrefix__.topP", "1.0");
 pref("__prefsPrefix__.enableTopP", true);
+pref("__prefsPrefix__.reasoningEffort", "default");
 pref("__prefsPrefix__.stream", true);
 pref("__prefsPrefix__.requestTimeout", "300000"); // 5分钟超时
 // MINERU API KEY
 pref("__prefsPrefix__.mineruApiKey", "");
+pref("__prefsPrefix__.mineruModelVersion", "vlm");
 
 // ==================== 提示词配置 ====================
 pref(
@@ -76,9 +86,14 @@ pref("__prefsPrefix__.batchInterval", "60");
 pref("__prefsPrefix__.autoScan", false);
 pref("__prefsPrefix__.scanInterval", "300");
 pref("__prefsPrefix__.pdfProcessMode", "base64"); // "text" 或 "base64"
+pref("__prefsPrefix__.pdfAttachmentMode", "default"); // "default" 或 "all"
 
 // ==================== 一图总结配置 ====================
+pref("__prefsPrefix__.imageSummaryCustomHeaders", ""); // 额外请求 Headers，JSON/Python dict 对象字符串
+pref("__prefsPrefix__.imageSummaryRequestTimeoutSeconds", "600"); // 生图请求超时，默认10分钟
+pref("__prefsPrefix__.imageSummaryAspectRatioEnabled", false); // 是否发送宽高比/size 参数
 pref("__prefsPrefix__.imageSummaryAspectRatio", "16:9"); // 图片宽高比，如 "1:1", "16:9", "9:16"
+pref("__prefsPrefix__.imageSummaryResolutionEnabled", false); // 是否发送分辨率/size 参数
 pref("__prefsPrefix__.imageSummaryResolution", "1K"); // 图片分辨率: "1K", "2K", "4K"
 
 // ==================== UI 配置 ====================
@@ -88,6 +103,23 @@ pref("__prefsPrefix__.autoScroll", true);
 pref("__prefsPrefix__.windowWidth", "900");
 pref("__prefsPrefix__.windowHeight", "700");
 pref("__prefsPrefix__.saveChatHistory", true);
+pref("__prefsPrefix__.contextMenuCollapsed", false);
+pref(
+  "__prefsPrefix__.contextMenuItemVisibility",
+  '{"generateSummary":true,"multiRoundReanalyze":true,"dashboard":true,"chatWithAI":true,"imageSummary":true,"mindmap":true,"fillTable":true,"literatureReview":true}',
+);
+pref(
+  "__prefsPrefix__.contextMenuItemOrder",
+  '["generateSummary","multiRoundReanalyze","dashboard","chatWithAI","imageSummary","mindmap","fillTable","literatureReview"]',
+);
+pref(
+  "__prefsPrefix__.sidebarModuleVisibility",
+  '{"actionButtons":true,"note":true,"table":true,"imageSummary":true,"mindmap":true,"quickChat":true}',
+);
+pref(
+  "__prefsPrefix__.sidebarModuleOrder",
+  '["actionButtons","note","table","imageSummary","mindmap","quickChat"]',
+);
 pref("__prefsPrefix__.sidebarNoteCollapsed", false);
 pref("__prefsPrefix__.sidebarImageCollapsed", false);
 

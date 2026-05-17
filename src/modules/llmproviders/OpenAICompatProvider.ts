@@ -1,7 +1,29 @@
 import { ILlmProvider } from "./ILlmProvider";
-import { ConversationMessage, LLMOptions, ProgressCb } from "./types";
+import {
+  ConversationMessage,
+  LLMOptions,
+  LLMModelInfo,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
+import {
+  getConnectionTestInput,
+  getConnectionTestModeLabel,
+} from "./shared/connectionTest";
+import {
+  deriveVersionedModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import { resolveReasoningEffort } from "./shared/reasoning";
+import {
+  bindAbortSignal,
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./shared/requestAbort";
 
 /**
  * OpenAI 旧接口兼容 Provider（Chat Completions 格式）
@@ -15,15 +37,41 @@ import { getRequestTimeoutMs } from "./shared/llmutils";
  */
 export class OpenAICompatProvider implements ILlmProvider {
   readonly id = "openai-compat"; // 供偏好使用的唯一标识
+  readonly capabilities: LLMProviderCapabilities = {
+    supportsText: true,
+    supportsStreaming: true,
+    supportsPdfBase64: true,
+    maxPdfFiles: 20,
+    supportsSystemPrompt: true,
+    supportedParams: [
+      "temperature",
+      "topP",
+      "maxTokens",
+      "stream",
+      "reasoningEffort",
+    ],
+  };
 
   private ensureUrlAndKey(options: LLMOptions) {
-    const apiUrl = (
+    const rawApiUrl = (
       options.apiUrl || "https://api.openai.com/v1/chat/completions"
     ).trim();
+    const apiUrl = this.normalizeChatCompletionsUrl(rawApiUrl);
     const apiKey = (options.apiKey || "").trim();
     if (!apiUrl) throw new Error("API URL 未配置");
     if (!apiKey) throw new Error("API Key 未配置");
     return { apiUrl, apiKey };
+  }
+
+  private normalizeChatCompletionsUrl(apiUrl: string): string {
+    const raw = apiUrl.trim().replace(/\/+$/, "");
+    if (!raw) return raw;
+    if (/\/(?:v\d+(?:beta)?\/)?chat\/completions$/i.test(raw)) return raw;
+    if (/\/v\d+(?:beta)?$/i.test(raw)) return `${raw}/chat/completions`;
+    if (/\/v\d+(?:beta)?\/.+$/i.test(raw)) {
+      return raw.replace(/(\/v\d+(?:beta)?)(?:\/.*)?$/i, "$1/chat/completions");
+    }
+    return `${raw}/v1/chat/completions`;
   }
 
   private buildHeaders(apiKey: string) {
@@ -39,7 +87,26 @@ export class OpenAICompatProvider implements ILlmProvider {
       params.temperature = options.temperature;
     if (options.topP !== undefined) params.top_p = options.topP;
     if (options.maxTokens !== undefined) params.max_tokens = options.maxTokens;
+    const reasoningEffort = resolveReasoningEffort(options.reasoningEffort);
+    if (reasoningEffort) params.reasoning_effort = reasoningEffort;
     return params;
+  }
+
+  private buildPdfFilePart(base64Content: string, filename = "document.pdf") {
+    const normalized = base64Content
+      .trim()
+      .replace(/^data:application\/pdf;base64,/i, "");
+    const safeFilename = filename.trim() || "document.pdf";
+
+    return {
+      type: "file",
+      file: {
+        filename: /\.pdf$/i.test(safeFilename)
+          ? safeFilename
+          : `${safeFilename}.pdf`,
+        file_data: `data:application/pdf;base64,${normalized}`,
+      },
+    };
   }
 
   async generateSummary(
@@ -52,6 +119,7 @@ export class OpenAICompatProvider implements ILlmProvider {
     const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
     const model = (options.model || "gpt-3.5-turbo").trim();
     const streamEnabled = options.stream ?? true;
+    throwIfAborted(options.abortSignal);
 
     // Chat Completions 的消息结构
     const messages: Array<{
@@ -61,15 +129,12 @@ export class OpenAICompatProvider implements ILlmProvider {
     messages.push({ role: "system", content: SYSTEM_ROLE_PROMPT });
 
     if (isBase64) {
-      // 尝试使用多模态格式（某些兼容服务支持 image_url 或 vision）
+      // Chat Completions 文件部件格式；PDF 用 application/pdf data URL。
       messages.push({
         role: "user",
         content: [
           { type: "text", text: prompt || "请分析这个文档。" },
-          {
-            type: "image_url",
-            image_url: { url: `data:application/pdf;base64,${content}` },
-          },
+          this.buildPdfFilePart(content, "paper.pdf"),
         ],
       });
     } else {
@@ -91,6 +156,7 @@ export class OpenAICompatProvider implements ILlmProvider {
       let partialLine = "";
       let gotAnyDelta = false;
       let abortError: Error | null = null;
+      let cleanupAbortSignal: (() => void) | undefined;
 
       try {
         await Zotero.HTTP.request("POST", apiUrl, {
@@ -98,7 +164,15 @@ export class OpenAICompatProvider implements ILlmProvider {
           body: JSON.stringify(payload),
           responseType: "text",
           timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+          errorDelayMax: 0,
           requestObserver: (xmlhttp: XMLHttpRequest) => {
+            cleanupAbortSignal = bindAbortSignal(
+              options.abortSignal,
+              xmlhttp,
+              (error) => {
+                abortError = error;
+              },
+            );
             xmlhttp.onprogress = (e: any) => {
               const status = e.target.status;
               if (status >= 400) {
@@ -176,8 +250,14 @@ export class OpenAICompatProvider implements ILlmProvider {
         });
       } catch (error: any) {
         if (abortError) {
+          if (isAbortError(abortError, options.abortSignal)) {
+            throw normalizeAbortError(abortError, options.abortSignal);
+          }
           if (gotAnyDelta && chunks.length > 0) return chunks.join("");
           throw abortError;
+        }
+        if (isAbortError(error, options.abortSignal)) {
+          throw normalizeAbortError(error, options.abortSignal);
         }
         let errorMessage = error?.message || "OpenAI 兼容请求失败";
         try {
@@ -198,25 +278,43 @@ export class OpenAICompatProvider implements ILlmProvider {
         }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw new Error(errorMessage);
+      } finally {
+        cleanupAbortSignal?.();
       }
 
       return chunks.join("");
     }
 
     // 非流式
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
     try {
       const res = await Zotero.HTTP.request("POST", apiUrl, {
         headers: this.buildHeaders(apiKey),
         body: JSON.stringify(basePayload),
         responseType: "json",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
+        requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
+        },
       });
+      throwIfAborted(options.abortSignal);
       const data = res.response || res;
       const text = data?.choices?.[0]?.message?.content || "";
       const result = typeof text === "string" ? text : JSON.stringify(text);
       if (onProgress && result) await onProgress(result);
       return result;
     } catch (e: any) {
+      if (abortError || isAbortError(e, options.abortSignal)) {
+        throw normalizeAbortError(abortError || e, options.abortSignal);
+      }
       let errorMessage = e?.message || "OpenAI 兼容请求失败";
       try {
         const responseText = e?.xmlhttp?.response || e?.xmlhttp?.responseText;
@@ -234,6 +332,8 @@ export class OpenAICompatProvider implements ILlmProvider {
         /* ignore */
       }
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
   }
 
@@ -262,17 +362,11 @@ export class OpenAICompatProvider implements ILlmProvider {
         if (isFirstUserMessage) {
           // 第一条用户消息需要附带论文内容
           if (isBase64) {
-            // Base64 模式：使用多模态格式
             messages.push({
               role: "user",
               content: [
                 { type: "text", text: msg.content },
-                {
-                  type: "image_url",
-                  image_url: {
-                    url: `data:application/pdf;base64,${pdfContent}`,
-                  },
-                },
+                this.buildPdfFilePart(pdfContent, "paper.pdf"),
               ],
             });
           } else {
@@ -301,6 +395,7 @@ export class OpenAICompatProvider implements ILlmProvider {
     let partialLine = "";
     let gotAnyDelta = false;
     let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -308,7 +403,15 @@ export class OpenAICompatProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -387,8 +490,14 @@ export class OpenAICompatProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "OpenAI 兼容请求失败";
       try {
@@ -409,14 +518,40 @@ export class OpenAICompatProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     return chunks.join("");
   }
 
+  async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
+    const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
+    const url = deriveVersionedModelsUrl(
+      apiUrl,
+      "https://api.openai.com/v1/chat/completions",
+    );
+    const data = await requestModelListJson(
+      url,
+      this.buildHeaders(apiKey),
+      options.requestTimeoutMs ?? 30000,
+    );
+    return parseModelListResponse(data);
+  }
+
   async testConnection(options: LLMOptions): Promise<string> {
     const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
     const model = (options.model || "gpt-3.5-turbo").trim();
+    const testInput = getConnectionTestInput(options);
+    const userContent = testInput.isBase64
+      ? [
+          { type: "text", text: testInput.text },
+          this.buildPdfFilePart(
+            testInput.pdfBase64 || "",
+            "connection-test.pdf",
+          ),
+        ]
+      : testInput.text;
 
     const payload = {
       model,
@@ -425,7 +560,7 @@ export class OpenAICompatProvider implements ILlmProvider {
         { role: "system", content: SYSTEM_ROLE_PROMPT },
         {
           role: "user",
-          content: "Hello! Please respond with 'OK' to confirm connection.",
+          content: userContent,
         },
       ],
       ...this.buildGenParams(options),
@@ -438,6 +573,7 @@ export class OpenAICompatProvider implements ILlmProvider {
       response = await Zotero.HTTP.request("POST", apiUrl, {
         headers: this.buildHeaders(apiKey),
         body: JSON.stringify(payload),
+        errorDelayMax: 0,
         responseType: "text", // 使用 text 以获取原始响应
         timeout: options.requestTimeoutMs ?? 30000,
       });
@@ -511,7 +647,7 @@ export class OpenAICompatProvider implements ILlmProvider {
       const json =
         typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
       const content = json?.choices?.[0]?.message?.content || "";
-      return `✅ 连接成功!\n模型: ${model}\n响应: ${content}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ 连接成功!\n模型: ${model}\n响应: ${content}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
     }
 
     const { APITestError } = await import("./types");
@@ -542,20 +678,21 @@ export class OpenAICompatProvider implements ILlmProvider {
   ): Promise<string> {
     const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
     const model = (options.model || "gpt-3.5-turbo").trim();
+    throwIfAborted(options.abortSignal);
 
     if (pdfFiles.length === 0) throw new Error("没有要处理的 PDF 文件");
 
-    // 构建 image_url 部分（使用 PDF data URI）
+    // 构建 Chat Completions file 部分（使用 PDF data URI）
     const fileParts: any[] = [];
     for (let i = 0; i < pdfFiles.length; i++) {
       const pdfFile = pdfFiles[i];
       if (pdfFile.base64Content && pdfFile.base64Content.length > 0) {
-        fileParts.push({
-          type: "image_url",
-          image_url: {
-            url: `data:application/pdf;base64,${pdfFile.base64Content}`,
-          },
-        });
+        fileParts.push(
+          this.buildPdfFilePart(
+            pdfFile.base64Content,
+            pdfFile.displayName || `document_${i + 1}.pdf`,
+          ),
+        );
         ztoolkit.log(
           `[AI-Butler] 添加 PDF 附件 (${i + 1}/${pdfFiles.length}): ${pdfFile.displayName}, base64 长度: ${pdfFile.base64Content.length}`,
         );
@@ -597,6 +734,7 @@ export class OpenAICompatProvider implements ILlmProvider {
     let partialLine = "";
     let gotAnyDelta = false;
     let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -604,7 +742,15 @@ export class OpenAICompatProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -683,8 +829,14 @@ export class OpenAICompatProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "OpenAI 兼容多文件请求失败";
       try {
@@ -705,6 +857,8 @@ export class OpenAICompatProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");

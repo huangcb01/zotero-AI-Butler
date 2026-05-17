@@ -21,3 +21,7 @@ test/00.env-setup.test.ts
 
 # agents
 AGENTS.md
+.agents/
+
+# local references
+reference/

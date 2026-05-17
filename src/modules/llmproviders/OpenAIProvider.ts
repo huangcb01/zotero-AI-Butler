@@ -1,10 +1,50 @@
 import { ILlmProvider } from "./ILlmProvider";
-import { ConversationMessage, LLMOptions, ProgressCb } from "./types";
+import {
+  ConversationMessage,
+  LLMOptions,
+  LLMModelInfo,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
+import {
+  getConnectionTestInput,
+  getConnectionTestModeLabel,
+} from "./shared/connectionTest";
+import {
+  deriveVersionedModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import {
+  parseOpenAIResponsesDelta,
+  parseOpenAIResponsesText,
+} from "./shared/openaiResponses";
+import { resolveOpenAIReasoningEffort } from "./shared/reasoning";
+import {
+  bindAbortSignal,
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./shared/requestAbort";
 
 export class OpenAIProvider implements ILlmProvider {
   readonly id = "openai";
+  readonly capabilities: LLMProviderCapabilities = {
+    supportsText: true,
+    supportsStreaming: true,
+    supportsPdfBase64: true,
+    maxPdfFiles: 20,
+    supportsSystemPrompt: true,
+    supportedParams: [
+      "temperature",
+      "topP",
+      "maxTokens",
+      "stream",
+      "reasoningEffort",
+    ],
+  };
 
   async generateSummary(
     content: string,
@@ -21,9 +61,13 @@ export class OpenAIProvider implements ILlmProvider {
 
     if (!apiUrl) throw new Error("API URL 未配置");
     if (!apiKey) throw new Error("API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
-    // Base64 使用 Responses API
-    if (isBase64) {
+    const useResponsesApi =
+      isBase64 || /\/v1\/responses\/?$/i.test(apiUrl.trim());
+
+    // OpenAI 官方 Provider 使用 Responses API；OpenAI-compatible 另有独立 Provider。
+    if (useResponsesApi) {
       const responsesUrl = /\/v1\/.+$/i.test(apiUrl)
         ? apiUrl.replace(/\/v1\/.+$/i, "/v1/responses")
         : apiUrl.endsWith("/v1/responses")
@@ -37,18 +81,31 @@ export class OpenAIProvider implements ILlmProvider {
         },
         {
           role: "user",
-          content: [
-            { type: "input_text", text: prompt || "" },
-            {
-              type: "input_file",
-              filename: "paper.pdf",
-              file_data: `data:application/pdf;base64,${content}`,
-            },
-          ],
+          content: isBase64
+            ? [
+                { type: "input_text", text: prompt || "" },
+                {
+                  type: "input_file",
+                  filename: "paper.pdf",
+                  file_data: `data:application/pdf;base64,${content}`,
+                },
+              ]
+            : [
+                {
+                  type: "input_text",
+                  text: buildUserMessage(prompt || "", content),
+                },
+              ],
         },
       ];
 
       const basePayload: any = { model, input };
+      if (options.temperature !== undefined)
+        basePayload.temperature = Number(temperature);
+      if (options.topP !== undefined) basePayload.top_p = Number(options.topP);
+      if (options.maxTokens !== undefined)
+        basePayload.max_output_tokens = Number(options.maxTokens);
+      this.applyResponsesReasoning(basePayload, model, options);
 
       if (streamEnabled && onProgress) {
         const payload = { ...basePayload, stream: true } as any;
@@ -58,6 +115,7 @@ export class OpenAIProvider implements ILlmProvider {
         let partialLine = "";
         let gotAnyDelta = false;
         let abortError: Error | null = null;
+        let cleanupAbortSignal: (() => void) | undefined;
 
         try {
           await Zotero.HTTP.request("POST", responsesUrl, {
@@ -68,7 +126,15 @@ export class OpenAIProvider implements ILlmProvider {
             body: JSON.stringify(payload),
             responseType: "text",
             timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+            errorDelayMax: 0,
             requestObserver: (xmlhttp: XMLHttpRequest) => {
+              cleanupAbortSignal = bindAbortSignal(
+                options.abortSignal,
+                xmlhttp,
+                (error) => {
+                  abortError = error;
+                },
+              );
               xmlhttp.onprogress = (e: any) => {
                 const status = e.target.status;
                 if (status >= 400) {
@@ -107,13 +173,10 @@ export class OpenAIProvider implements ILlmProvider {
                       if (!jsonStr || jsonStr === "[DONE]") continue;
                       try {
                         const evt = JSON.parse(jsonStr);
-                        const t = evt?.type as string;
-                        if (
-                          t === "response.output_text.delta" &&
-                          typeof evt.delta === "string"
-                        ) {
+                        const delta = parseOpenAIResponsesDelta(evt);
+                        if (delta) {
                           gotAnyDelta = true;
-                          chunks.push(evt.delta.replace(/\n+/g, "\n"));
+                          chunks.push(delta.replace(/\n+/g, "\n"));
                           const current = chunks.join("");
                           if (onProgress && current.length > delivered) {
                             const newChunk = current.slice(delivered);
@@ -151,9 +214,16 @@ export class OpenAIProvider implements ILlmProvider {
             },
           });
         } catch (error: any) {
-          if (abortError) {
+          const currentAbortError = abortError as Error | null;
+          if (currentAbortError) {
+            if (isAbortError(currentAbortError, options.abortSignal)) {
+              throw normalizeAbortError(currentAbortError, options.abortSignal);
+            }
             if (gotAnyDelta && chunks.length > 0) return chunks.join("");
-            throw abortError;
+            throw currentAbortError;
+          }
+          if (isAbortError(error, options.abortSignal)) {
+            throw normalizeAbortError(error, options.abortSignal);
           }
           let errorMessage = error?.message || "OpenAI Responses 请求失败";
           try {
@@ -174,12 +244,16 @@ export class OpenAIProvider implements ILlmProvider {
           }
           if (gotAnyDelta && chunks.length > 0) return chunks.join("");
           throw new Error(errorMessage);
+        } finally {
+          cleanupAbortSignal?.();
         }
 
         return chunks.join("");
       }
 
       // 非流式
+      let abortError: Error | null = null;
+      let cleanupAbortSignal: (() => void) | undefined;
       try {
         const res = await Zotero.HTTP.request("POST", responsesUrl, {
           headers: {
@@ -189,12 +263,26 @@ export class OpenAIProvider implements ILlmProvider {
           body: JSON.stringify(basePayload),
           responseType: "json",
           timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+          errorDelayMax: 0,
+          requestObserver: (xmlhttp: XMLHttpRequest) => {
+            cleanupAbortSignal = bindAbortSignal(
+              options.abortSignal,
+              xmlhttp,
+              (error) => {
+                abortError = error;
+              },
+            );
+          },
         });
+        throwIfAborted(options.abortSignal);
         const data = res.response || res;
-        const text = (data?.output_text as string) || "";
+        const text = parseOpenAIResponsesText(data);
         if (onProgress && text) await onProgress(text);
         return text;
       } catch (e: any) {
+        if (abortError || isAbortError(e, options.abortSignal)) {
+          throw normalizeAbortError(abortError || e, options.abortSignal);
+        }
         let errorMessage = e?.message || "OpenAI Responses 请求失败";
         try {
           const responseText = e?.xmlhttp?.response || e?.xmlhttp?.responseText;
@@ -212,6 +300,8 @@ export class OpenAIProvider implements ILlmProvider {
           /* ignore */
         }
         throw new Error(errorMessage);
+      } finally {
+        cleanupAbortSignal?.();
       }
     }
 
@@ -227,6 +317,7 @@ export class OpenAIProvider implements ILlmProvider {
     };
     if (options.temperature !== undefined)
       basePayload.temperature = Number(temperature);
+    this.applyChatReasoning(basePayload, model, options);
 
     if (streamEnabled && onProgress) {
       const body = JSON.stringify({ ...basePayload, stream: true });
@@ -238,6 +329,7 @@ export class OpenAIProvider implements ILlmProvider {
       let streamComplete = false;
       let abortedDueToError = false;
       let errorFromProgress: Error | null = null;
+      let cleanupAbortSignal: (() => void) | undefined;
 
       try {
         await Zotero.HTTP.request("POST", apiUrl, {
@@ -248,7 +340,16 @@ export class OpenAIProvider implements ILlmProvider {
           body,
           responseType: "text",
           timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+          errorDelayMax: 0,
           requestObserver: (xmlhttp: XMLHttpRequest) => {
+            cleanupAbortSignal = bindAbortSignal(
+              options.abortSignal,
+              xmlhttp,
+              (error) => {
+                abortedDueToError = true;
+                errorFromProgress = error;
+              },
+            );
             xmlhttp.onprogress = (e: any) => {
               const status = e.target.status;
               if (status >= 400) {
@@ -342,6 +443,12 @@ export class OpenAIProvider implements ILlmProvider {
           },
         });
       } catch (error: any) {
+        if (isAbortError(errorFromProgress || error, options.abortSignal)) {
+          throw normalizeAbortError(
+            errorFromProgress || error,
+            options.abortSignal,
+          );
+        }
         if (abortedDueToError && errorFromProgress) throw errorFromProgress;
         if (streamComplete && gotAnyDelta) return chunks.join("");
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
@@ -363,6 +470,8 @@ export class OpenAIProvider implements ILlmProvider {
             error?.message || error?.xmlhttp?.statusText || String(error);
         }
         throw new Error(errorMessage);
+      } finally {
+        cleanupAbortSignal?.();
       }
 
       const streamed = chunks.join("");
@@ -373,6 +482,7 @@ export class OpenAIProvider implements ILlmProvider {
         apiUrl,
         apiKey,
         basePayload,
+        options,
         onProgress,
       );
     }
@@ -381,6 +491,7 @@ export class OpenAIProvider implements ILlmProvider {
       apiUrl,
       apiKey,
       basePayload,
+      options,
       onProgress,
     );
   }
@@ -396,11 +507,13 @@ export class OpenAIProvider implements ILlmProvider {
     const apiUrl = (options.apiUrl || "").trim();
     const model = (options.model || "gpt-3.5-turbo").trim();
     const temperature = options.temperature ?? 0.7;
+    const streamEnabled = options.stream ?? true;
 
     if (!apiUrl) throw new Error("API URL 未配置");
     if (!apiKey) throw new Error("API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
-    if (isBase64) {
+    if (isBase64 || /\/v1\/responses\/?$/i.test(apiUrl.trim())) {
       const responsesUrl = /\/v1\/.+$/i.test(apiUrl)
         ? apiUrl.replace(/\/v1\/.+$/i, "/v1/responses")
         : apiUrl.endsWith("/v1/responses")
@@ -423,13 +536,20 @@ export class OpenAIProvider implements ILlmProvider {
           )
           .join("\n\n");
         const userParts: any[] = [
-          { type: "input_text", text: firstUser.content },
           {
+            type: "input_text",
+            text: isBase64
+              ? firstUser.content
+              : buildUserMessage(firstUser.content, pdfContent || ""),
+          },
+        ];
+        if (isBase64) {
+          userParts.push({
             type: "input_file",
             filename: "paper.pdf",
             file_data: `data:application/pdf;base64,${pdfContent}`,
-          },
-        ];
+          });
+        }
         if (extraHistoryText)
           userParts.push({
             type: "input_text",
@@ -438,7 +558,69 @@ export class OpenAIProvider implements ILlmProvider {
         inputs.push({ role: "user", content: userParts });
       }
 
-      const payload: any = { model, input: inputs, stream: true };
+      const basePayload: any = { model, input: inputs };
+      if (options.temperature !== undefined)
+        basePayload.temperature = Number(temperature);
+      if (options.topP !== undefined) basePayload.top_p = Number(options.topP);
+      if (options.maxTokens !== undefined)
+        basePayload.max_output_tokens = Number(options.maxTokens);
+      this.applyResponsesReasoning(basePayload, model, options);
+
+      if (!streamEnabled || !onProgress) {
+        let abortError: Error | null = null;
+        let cleanupAbortSignal: (() => void) | undefined;
+        try {
+          const res = await Zotero.HTTP.request("POST", responsesUrl, {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(basePayload),
+            responseType: "json",
+            timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+            errorDelayMax: 0,
+            requestObserver: (xmlhttp: XMLHttpRequest) => {
+              cleanupAbortSignal = bindAbortSignal(
+                options.abortSignal,
+                xmlhttp,
+                (error) => {
+                  abortError = error;
+                },
+              );
+            },
+          });
+          throwIfAborted(options.abortSignal);
+          const text = parseOpenAIResponsesText(res.response || res);
+          if (onProgress && text) await onProgress(text);
+          return text;
+        } catch (error: any) {
+          if (abortError || isAbortError(error, options.abortSignal)) {
+            throw normalizeAbortError(abortError || error, options.abortSignal);
+          }
+          let errorMessage = error?.message || "OpenAI Responses 请求失败";
+          try {
+            const responseText =
+              error?.xmlhttp?.response || error?.xmlhttp?.responseText;
+            if (responseText) {
+              const parsed =
+                typeof responseText === "string"
+                  ? JSON.parse(responseText)
+                  : responseText;
+              const err = parsed?.error || parsed;
+              const code = err?.code || "Error";
+              const msg = err?.message || error?.message || String(error);
+              errorMessage = `${code}: ${msg}`;
+            }
+          } catch {
+            /* ignore */
+          }
+          throw new Error(errorMessage);
+        } finally {
+          cleanupAbortSignal?.();
+        }
+      }
+
+      const payload: any = { ...basePayload, stream: true };
 
       const chunks: string[] = [];
       let delivered = 0;
@@ -446,6 +628,7 @@ export class OpenAIProvider implements ILlmProvider {
       let partialLine = "";
       let gotAnyDelta = false;
       let abortError: Error | null = null;
+      let cleanupAbortSignal: (() => void) | undefined;
 
       try {
         await Zotero.HTTP.request("POST", responsesUrl, {
@@ -456,7 +639,15 @@ export class OpenAIProvider implements ILlmProvider {
           body: JSON.stringify(payload),
           responseType: "text",
           timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+          errorDelayMax: 0,
           requestObserver: (xmlhttp: XMLHttpRequest) => {
+            cleanupAbortSignal = bindAbortSignal(
+              options.abortSignal,
+              xmlhttp,
+              (error) => {
+                abortError = error;
+              },
+            );
             xmlhttp.onprogress = (e: any) => {
               const status = e.target.status;
               if (status >= 400) {
@@ -495,13 +686,10 @@ export class OpenAIProvider implements ILlmProvider {
                     if (!jsonStr || jsonStr === "[DONE]") continue;
                     try {
                       const evt = JSON.parse(jsonStr);
-                      const t = evt?.type as string;
-                      if (
-                        t === "response.output_text.delta" &&
-                        typeof evt.delta === "string"
-                      ) {
+                      const delta = parseOpenAIResponsesDelta(evt);
+                      if (delta) {
                         gotAnyDelta = true;
-                        chunks.push(evt.delta.replace(/\n+/g, "\n"));
+                        chunks.push(delta.replace(/\n+/g, "\n"));
                         const current = chunks.join("");
                         if (onProgress && current.length > delivered) {
                           const newChunk = current.slice(delivered);
@@ -540,8 +728,14 @@ export class OpenAIProvider implements ILlmProvider {
         });
       } catch (error: any) {
         if (abortError) {
+          if (isAbortError(abortError, options.abortSignal)) {
+            throw normalizeAbortError(abortError, options.abortSignal);
+          }
           if (gotAnyDelta && chunks.length > 0) return chunks.join("");
           throw abortError;
+        }
+        if (isAbortError(error, options.abortSignal)) {
+          throw normalizeAbortError(error, options.abortSignal);
         }
         let errorMessage = error?.message || "OpenAI Responses 请求失败";
         try {
@@ -562,6 +756,8 @@ export class OpenAIProvider implements ILlmProvider {
         }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw new Error(errorMessage);
+      } finally {
+        cleanupAbortSignal?.();
       }
 
       return chunks.join("");
@@ -601,6 +797,7 @@ export class OpenAIProvider implements ILlmProvider {
     }
 
     const payload = { model, input, temperature, stream: true } as any;
+    this.applyChatReasoning(payload, model, options);
 
     const chunks: string[] = [];
     let delivered = 0;
@@ -608,6 +805,7 @@ export class OpenAIProvider implements ILlmProvider {
     let partialLine = "";
     let abortError: Error | null = null;
     let gotAnyDelta = false;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -618,7 +816,15 @@ export class OpenAIProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -704,10 +910,16 @@ export class OpenAIProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) {
           return chunks.join("");
         }
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "OpenAI 请求失败";
       try {
@@ -733,9 +945,31 @@ export class OpenAIProvider implements ILlmProvider {
       });
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     return chunks.join("");
+  }
+
+  async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
+    const apiKey = (options.apiKey || "").trim();
+    const apiUrl = (options.apiUrl || "https://api.openai.com/v1/responses")
+      .trim()
+      .replace(/\/+$/, "");
+    if (!apiUrl) throw new Error("API URL 未配置");
+    if (!apiKey) throw new Error("API Key 未配置");
+
+    const url = deriveVersionedModelsUrl(
+      apiUrl,
+      "https://api.openai.com/v1/responses",
+    );
+    const data = await requestModelListJson(
+      url,
+      { Authorization: `Bearer ${apiKey}` },
+      options.requestTimeoutMs ?? 30000,
+    );
+    return parseModelListResponse(data);
   }
 
   async testConnection(options: LLMOptions): Promise<string> {
@@ -750,22 +984,38 @@ export class OpenAIProvider implements ILlmProvider {
       : apiUrl.endsWith("/v1/responses")
         ? apiUrl
         : apiUrl.replace(/\/?$/, "/v1/responses");
+    const testInput = getConnectionTestInput(options);
+    const userContent = testInput.isBase64
+      ? [
+          {
+            type: "input_text",
+            text: testInput.text,
+          },
+          {
+            type: "input_file",
+            filename: "connection-test.pdf",
+            file_data: `data:application/pdf;base64,${testInput.pdfBase64 || ""}`,
+          },
+        ]
+      : [
+          {
+            type: "input_text",
+            text: testInput.text,
+          },
+        ];
 
     const payload = {
       model,
       input: [
         {
           role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Hello! Please respond with 'OK' to confirm connection.",
-            },
-          ],
+          content: userContent,
         },
       ],
+      max_output_tokens: options.maxTokens ?? 16,
       stream: false,
     } as any;
+    this.applyResponsesReasoning(payload, model, options);
     const payloadStr = JSON.stringify(payload, null, 2);
 
     let response: any;
@@ -777,6 +1027,7 @@ export class OpenAIProvider implements ILlmProvider {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(payload),
+        errorDelayMax: 0,
         responseType: "text", // 使用 text 以获取原始响应
         timeout: 30000,
       });
@@ -849,8 +1100,8 @@ export class OpenAIProvider implements ILlmProvider {
     if (status === 200) {
       const json =
         typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
-      const content = json?.output_text || "";
-      return `✅ 连接成功!\n模型: ${model}\n响应: ${content}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      const content = parseOpenAIResponsesText(json);
+      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ 连接成功!\n模型: ${model}\n响应: ${content}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
     }
 
     const { APITestError } = await import("./types");
@@ -886,6 +1137,7 @@ export class OpenAIProvider implements ILlmProvider {
     if (!apiUrl) throw new Error("API URL 未配置");
     if (!apiKey) throw new Error("API Key 未配置");
     if (pdfFiles.length === 0) throw new Error("没有要处理的 PDF 文件");
+    throwIfAborted(options.abortSignal);
 
     // 使用 Responses API
     const responsesUrl = /\/v1\/.+$/i.test(apiUrl)
@@ -934,6 +1186,7 @@ export class OpenAIProvider implements ILlmProvider {
     ];
 
     const payload = { model, input, stream: true } as any;
+    this.applyResponsesReasoning(payload, model, options);
 
     const chunks: string[] = [];
     let delivered = 0;
@@ -941,6 +1194,7 @@ export class OpenAIProvider implements ILlmProvider {
     let partialLine = "";
     let gotAnyDelta = false;
     let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", responsesUrl, {
@@ -951,7 +1205,15 @@ export class OpenAIProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -1033,8 +1295,14 @@ export class OpenAIProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "OpenAI 多文件请求失败";
       try {
@@ -1055,6 +1323,8 @@ export class OpenAIProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");
@@ -1062,25 +1332,72 @@ export class OpenAIProvider implements ILlmProvider {
     return "";
   }
 
+  private applyResponsesReasoning(
+    payload: Record<string, unknown>,
+    model: string,
+    options: LLMOptions,
+  ): void {
+    const effort = resolveOpenAIReasoningEffort(model, options.reasoningEffort);
+    if (effort) {
+      payload.reasoning = { effort };
+    }
+  }
+
+  private applyChatReasoning(
+    payload: Record<string, unknown>,
+    model: string,
+    options: LLMOptions,
+  ): void {
+    const effort = resolveOpenAIReasoningEffort(model, options.reasoningEffort);
+    if (effort) {
+      payload.reasoning_effort = effort;
+    }
+  }
+
   private async nonStreamCompletion(
     apiUrl: string,
     apiKey: string,
     payload: any,
+    options: LLMOptions,
     onProgress?: ProgressCb,
   ): Promise<string> {
-    const res = await Zotero.HTTP.request("POST", apiUrl, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(payload),
-      responseType: "json",
-    });
-    const data = res.response || res;
-    const text = data?.choices?.[0]?.message?.content || "";
-    const result = typeof text === "string" ? text : JSON.stringify(text);
-    if (onProgress && result) await onProgress(result);
-    return result;
+    throwIfAborted(options.abortSignal);
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
+    try {
+      const res = await Zotero.HTTP.request("POST", apiUrl, {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+        responseType: "json",
+        timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
+        requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
+        },
+      });
+      throwIfAborted(options.abortSignal);
+      const data = res.response || res;
+      const text = data?.choices?.[0]?.message?.content || "";
+      const result = typeof text === "string" ? text : JSON.stringify(text);
+      if (onProgress && result) await onProgress(result);
+      return result;
+    } catch (error) {
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
+      throw error;
+    } finally {
+      cleanupAbortSignal?.();
+    }
   }
 }
 

@@ -26,7 +26,15 @@
  */
 
 import { PDFExtractor } from "./pdfExtractor";
-import { LLMClient } from "./llmClient";
+import LLMService, { type LLMChatRequest } from "./llmService";
+import { LLMEndpointManager, type LLMEndpoint } from "./llmEndpointManager";
+import {
+  LLMNoteMetadataService,
+  type LLMNoteMetadata,
+} from "./llmNoteMetadata";
+import { markdownToZoteroNoteHtml } from "./noteMarkdown";
+import type { LLMAbortSignal, LLMResponse } from "./llmproviders/types";
+import { throwIfAborted } from "./llmproviders/shared/requestAbort";
 import { SummaryView } from "./views/SummaryView";
 import { getPref } from "../utils/prefs";
 import { MainWindow } from "./views/MainWindow";
@@ -39,6 +47,15 @@ import {
   type MultiRoundPromptItem,
   type SummaryMode,
 } from "../utils/prompts";
+import { isRegularSummaryNote } from "./aiNoteClassifier";
+
+type MultiModelSummaryResult = {
+  endpoint: LLMEndpoint;
+  content: string;
+  response: LLMResponse;
+  metadata: LLMNoteMetadata;
+  noteHtml: string;
+};
 
 /**
  * AI 笔记生成器类
@@ -80,14 +97,21 @@ export class NoteGenerator {
     outputWindow?: SummaryView,
     progressCallback?: (message: string, progress: number) => void,
     streamCallback?: (chunk: string) => void,
-    options?: { summaryMode?: string; forceOverwrite?: boolean },
+    options?: {
+      summaryMode?: string;
+      forceOverwrite?: boolean;
+      abortSignal?: LLMAbortSignal;
+    },
   ): Promise<{ note: Zotero.Item; content: string }> {
     // 获取文献标题,用于日志和用户反馈
     const itemTitle = item.getField("title") as string;
     let note: Zotero.Item | null = null;
     let fullContent = "";
+    let llmMetadata: LLMNoteMetadata | null = null;
+    let noteContentOverride: string | null = null;
 
     try {
+      throwIfAborted(options?.abortSignal);
       // 笔记管理策略: skip/overwrite/append
       const policy = (
         (getPref("noteStrategy" as any) as string) || "skip"
@@ -105,6 +129,7 @@ export class NoteGenerator {
       }
 
       // 步骤 1: PDF 处理
+      throwIfAborted(options?.abortSignal);
       progressCallback?.("正在处理PDF...", 10);
 
       // 检查 PDF 文件大小限制
@@ -126,20 +151,43 @@ export class NoteGenerator {
       const prefMode = (getPref("pdfProcessMode") as string) || "base64";
       const pdfAttachmentMode =
         (getPref("pdfAttachmentMode" as any) as string) || "default";
+      const summaryMode = (options?.summaryMode ||
+        (getPref("summaryMode" as any) as string) ||
+        "single") as SummaryMode;
+      const multiModelEndpoints =
+        LLMEndpointManager.isMultiModelSummaryEnabled()
+          ? LLMEndpointManager.getMultiModelSummaryEndpoints()
+          : [];
+      const useMultiModelSummary = multiModelEndpoints.length > 0;
+      if (
+        LLMEndpointManager.isMultiModelSummaryEnabled() &&
+        multiModelEndpoints.length === 0
+      ) {
+        throw new Error(
+          "已启用多模型同时总结，但没有可用的大模型供应商。请在设置的“模型平台”中选择至少一个已启用供应商。",
+        );
+      }
 
-      let pdfContent: string;
+      let pdfContent = "";
       let isBase64 = false;
       let useMultiPdfMode = false;
 
       // 检查是否应该使用多 PDF 模式
-      if (pdfAttachmentMode === "all" && prefMode === "base64") {
+      if (
+        !useMultiModelSummary &&
+        summaryMode === "single" &&
+        pdfAttachmentMode === "all" &&
+        prefMode === "base64"
+      ) {
         const allPdfs = await PDFExtractor.getAllPdfAttachments(item);
 
         if (allPdfs.length > 1) {
           // 检查当前 provider 是否支持多文件上传
-          const provider = LLMClient.getCurrentProvider();
+          const provider = LLMService.getCurrentProvider();
           const supportsMultiFile =
-            provider && typeof provider.generateMultiFileSummary === "function";
+            provider &&
+            LLMService.getProviderCapabilities(provider).maxPdfFiles > 1 &&
+            typeof provider.generateMultiFileSummary === "function";
 
           if (supportsMultiFile) {
             useMultiPdfMode = true;
@@ -166,9 +214,8 @@ export class NoteGenerator {
         }
       }
 
-      // 根据模式处理 PDF
-      if (!useMultiPdfMode) {
-        // 单 PDF 模式 (默认)
+      // 多轮总结会复用同一份 PDF 内容；单次总结交给 LLMService 统一解析，避免 MinerU 重复处理。
+      if (summaryMode !== "single") {
         if (prefMode === "base64") {
           pdfContent = await PDFExtractor.extractBase64FromItem(item);
           isBase64 = true;
@@ -178,20 +225,11 @@ export class NoteGenerator {
           pdfContent = PDFExtractor.truncateText(cleanedText);
           isBase64 = false;
         }
-      } else {
-        // 多 PDF 模式 - 将在后续 AI 调用时直接使用
-        // 这里设置占位符，实际处理在 LLMClient 中
-        pdfContent = "__MULTI_PDF_MODE__";
-        isBase64 = true;
       }
 
       // 步骤 2: AI 模型总结生成
-      // 读取总结模式配置 - 优先使用传入的 options.summaryMode
-      const summaryMode = (options?.summaryMode ||
-        (getPref("summaryMode" as any) as string) ||
-        "single") as SummaryMode;
-
       // 通知进度回调开始 AI 分析 (40% 完成)
+      throwIfAborted(options?.abortSignal);
       progressCallback?.(
         summaryMode === "single"
           ? "正在生成AI总结..."
@@ -206,7 +244,25 @@ export class NoteGenerator {
       }
 
       // 根据总结模式选择不同的生成策略
-      if (summaryMode === "single") {
+      if (useMultiModelSummary) {
+        const multiModelResult = await this.generateMultiModelSummaryContent({
+          item,
+          itemTitle,
+          endpoints: multiModelEndpoints,
+          summaryMode,
+          pdfContent,
+          isBase64,
+          pdfAttachmentMode,
+          prefMode,
+          outputWindow,
+          progressCallback,
+          streamCallback,
+          abortSignal: options?.abortSignal,
+        });
+        fullContent = multiModelResult.content;
+        noteContentOverride = multiModelResult.noteHtml;
+        llmMetadata = null;
+      } else if (summaryMode === "single") {
         // 单次对话模式：使用传统的单次总结
         // 定义流式输出回调函数
         const onProgress = async (chunk: string) => {
@@ -224,56 +280,35 @@ export class NoteGenerator {
           }
         };
 
-        let summary: string;
+        let response: LLMResponse;
         if (useMultiPdfMode) {
-          // 多 PDF 模式：获取所有 PDF 并调用多文件接口
-          const allPdfs = await PDFExtractor.getAllPdfAttachments(item);
-          const pdfFiles = await Promise.all(
-            allPdfs.map(async (pdf) => {
-              const path = await pdf.getFilePathAsync();
-              if (!path || typeof path !== "string") {
-                throw new Error(`无法获取 PDF 文件路径: ${pdf.id}`);
-              }
-              // 获取 Base64 内容
-              const pdfData = await Zotero.File.getBinaryContentsAsync(path);
-              const bytes = new Uint8Array(pdfData.length);
-              for (let i = 0; i < pdfData.length; i++) {
-                bytes[i] = pdfData.charCodeAt(i);
-              }
-              let binary = "";
-              const len = bytes.byteLength;
-              for (let i = 0; i < len; i++) {
-                binary += String.fromCharCode(bytes[i]);
-              }
-              const base64Content = btoa(binary);
-
-              return {
-                filePath: path || "",
-                displayName:
-                  (pdf.getField("title") as string) || `PDF-${pdf.id}`,
-                base64Content,
-              };
-            }),
-          );
-
-          summary = await LLMClient.generateMultiFileSummary(
-            pdfFiles,
-            undefined, // 使用默认 prompt 解析逻辑
+          response = await LLMService.generate({
+            task: "summary",
+            content: {
+              kind: "zotero-item",
+              item,
+              attachmentMode: "all",
+            },
+            transport: { abortSignal: options?.abortSignal },
             onProgress,
-          );
+          });
         } else {
-          // 单 PDF 模式：使用原有方法
-          summary = await LLMClient.generateSummaryWithRetry(
-            pdfContent,
-            isBase64,
-            undefined,
+          response = await LLMService.generate({
+            task: "summary",
+            content: {
+              kind: "zotero-item",
+              item,
+              attachmentMode: "default",
+            },
+            transport: { abortSignal: options?.abortSignal },
             onProgress,
-          );
+          });
         }
-        fullContent = summary;
+        fullContent = response.text;
+        llmMetadata = LLMNoteMetadataService.fromResponse("summary", response);
       } else {
         // 多轮对话模式
-        fullContent = await this.generateMultiRoundContent(
+        const multiRoundResult = await this.generateMultiRoundContent(
           pdfContent,
           isBase64,
           itemTitle,
@@ -281,11 +316,19 @@ export class NoteGenerator {
           outputWindow,
           progressCallback,
           streamCallback,
+          undefined,
+          options?.abortSignal,
+        );
+        fullContent = multiRoundResult.content;
+        llmMetadata = LLMNoteMetadataService.fromResponse(
+          "summary",
+          multiRoundResult.response,
         );
       }
 
       // 步骤 3: 创建/更新笔记
       // 通知进度回调开始创建笔记 (80% 完成)
+      throwIfAborted(options?.abortSignal);
       progressCallback?.("正在创建笔记...", 80);
 
       // 检查内容是否为空，防止创建空笔记
@@ -294,11 +337,12 @@ export class NoteGenerator {
       }
 
       // 格式化笔记内容,添加标题和样式
-      const noteContent = this.formatNoteContent(
-        itemTitle,
-        fullContent,
-        "AI 总结",
-      );
+      let noteContent =
+        noteContentOverride ||
+        this.formatNoteContent(itemTitle, fullContent, "AI 管家");
+      if (!noteContentOverride && llmMetadata) {
+        noteContent = LLMNoteMetadataService.wrapHtml(noteContent, llmMetadata);
+      }
 
       if (existing) {
         // 覆盖或追加到已有笔记
@@ -390,8 +434,8 @@ export class NoteGenerator {
     }
   }
 
-  /** 查找已有的 AI 笔记(通过标签或标题标识) */
-  private static async findExistingNote(
+  /** 查找已有的 AI 总结笔记(通过标签或标题标识，排除后续追问等独立笔记) */
+  public static async findExistingNote(
     item: Zotero.Item,
   ): Promise<Zotero.Item | null> {
     try {
@@ -401,11 +445,8 @@ export class NoteGenerator {
         const n = await Zotero.Items.getAsync(nid);
         if (!n) continue;
         const tags: Array<{ tag: string }> = (n as any).getTags?.() || [];
-        const hasTag = tags.some((t) => t.tag === "AI-Generated");
-        const hasTableTag = tags.some((t) => t.tag === "AI-Table");
         const noteHtml: string = (n as any).getNote?.() || "";
-        const titleMatch = /<h2>\s*AI 管家\s*-/.test(noteHtml);
-        if (!hasTableTag && (hasTag || titleMatch)) {
+        if (isRegularSummaryNote(tags, noteHtml)) {
           if (!target) target = n;
           else {
             const a = (target as any).dateModified || 0;
@@ -418,6 +459,266 @@ export class NoteGenerator {
     } catch {
       return null;
     }
+  }
+
+  private static async generateMultiModelSummaryContent(params: {
+    item: Zotero.Item;
+    itemTitle: string;
+    endpoints: LLMEndpoint[];
+    summaryMode: SummaryMode;
+    pdfContent: string;
+    isBase64: boolean;
+    pdfAttachmentMode: string;
+    prefMode: string;
+    outputWindow?: SummaryView;
+    progressCallback?: (message: string, progress: number) => void;
+    streamCallback?: (chunk: string) => void;
+    abortSignal?: LLMAbortSignal;
+  }): Promise<{ content: string; noteHtml: string }> {
+    const {
+      item,
+      itemTitle,
+      endpoints,
+      summaryMode,
+      pdfContent,
+      isBase64,
+      pdfAttachmentMode,
+      prefMode,
+      outputWindow,
+      progressCallback,
+      streamCallback,
+      abortSignal,
+    } = params;
+    const total = endpoints.length;
+    let completed = 0;
+
+    progressCallback?.(`正在使用 ${total} 个模型同时总结...`, 42);
+    if (outputWindow) {
+      outputWindow.showLoadingState(
+        `正在使用 ${total} 个模型分析「${itemTitle}」`,
+      );
+    }
+
+    const tasks = endpoints.map(async (endpoint) => {
+      try {
+        const result = await this.generateSummaryWithEndpoint({
+          item,
+          itemTitle,
+          endpoint,
+          summaryMode,
+          pdfContent,
+          isBase64,
+          pdfAttachmentMode,
+          prefMode,
+          abortSignal,
+        });
+        completed++;
+        progressCallback?.(
+          `模型总结完成：${endpoint.name} (${completed}/${total})`,
+          42 + Math.floor((completed / total) * 36),
+        );
+        return result;
+      } catch (error: any) {
+        completed++;
+        const normalized =
+          error instanceof Error ? error : new Error(String(error));
+        ztoolkit.log(
+          `[AI Butler] 多模型总结失败: ${endpoint.name}`,
+          normalized,
+        );
+        progressCallback?.(
+          `模型总结失败：${endpoint.name} (${completed}/${total})`,
+          42 + Math.floor((completed / total) * 36),
+        );
+        return { endpoint, error: normalized };
+      }
+    });
+
+    const settled = await Promise.all(tasks);
+    const successes = settled.filter(
+      (result): result is MultiModelSummaryResult => "noteHtml" in result,
+    );
+    const failures = settled.filter(
+      (
+        result,
+      ): result is {
+        endpoint: LLMEndpoint;
+        error: Error;
+      } => "error" in result,
+    );
+
+    if (successes.length === 0) {
+      const details = failures
+        .map((failure) => `${failure.endpoint.name}: ${failure.error.message}`)
+        .join("\n");
+      const error = new Error(`多模型同时总结全部失败。\n${details}`);
+      const suppressAll =
+        failures.length > 0 &&
+        failures.every(
+          (failure) =>
+            (failure.error as Error & { suppressTaskRetry?: boolean })
+              .suppressTaskRetry === true,
+        );
+      if (suppressAll) {
+        (error as Error & { suppressTaskRetry?: boolean }).suppressTaskRetry =
+          true;
+      }
+      throw error;
+    }
+
+    const content = successes
+      .map((result) => this.formatMultiModelDisplayMarkdown(result))
+      .join("\n\n---\n\n");
+    const noteHtml = successes
+      .map((result) => result.noteHtml)
+      .join("\n<hr/>\n");
+    const displayContent = [
+      `**多模型同时总结完成：${successes.length}/${total} 个模型成功**`,
+      "",
+      content,
+      failures.length > 0
+        ? [
+            "",
+            "---",
+            "",
+            "## 失败的供应商",
+            "",
+            ...failures.map(
+              (failure) =>
+                `- ${failure.endpoint.name}: ${failure.error.message}`,
+            ),
+          ].join("\n")
+        : "",
+    ]
+      .filter((part) => part.trim().length > 0)
+      .join("\n\n");
+
+    if (outputWindow) {
+      outputWindow.startItem(itemTitle);
+      outputWindow.appendContent(displayContent);
+      outputWindow.finishItem();
+    }
+    try {
+      streamCallback?.(displayContent);
+    } catch (error) {
+      ztoolkit.log("[AI Butler] streamCallback error:", error);
+    }
+
+    progressCallback?.(
+      failures.length > 0
+        ? `多模型总结完成：${successes.length} 个成功，${failures.length} 个失败`
+        : "多模型总结完成",
+      80,
+    );
+
+    return { content, noteHtml };
+  }
+
+  private static async generateSummaryWithEndpoint(params: {
+    item: Zotero.Item;
+    itemTitle: string;
+    endpoint: LLMEndpoint;
+    summaryMode: SummaryMode;
+    pdfContent: string;
+    isBase64: boolean;
+    pdfAttachmentMode: string;
+    prefMode: string;
+    abortSignal?: LLMAbortSignal;
+  }): Promise<MultiModelSummaryResult> {
+    const {
+      item,
+      itemTitle,
+      endpoint,
+      summaryMode,
+      pdfContent,
+      isBase64,
+      pdfAttachmentMode,
+      prefMode,
+      abortSignal,
+    } = params;
+
+    let content = "";
+    let response: LLMResponse | undefined;
+
+    if (summaryMode === "single") {
+      const attachmentMode = this.resolveEndpointAttachmentMode(
+        endpoint,
+        pdfAttachmentMode,
+        prefMode,
+      );
+      response = await LLMService.generateWithEndpoint(endpoint.id, {
+        task: "summary",
+        content: {
+          kind: "zotero-item",
+          item,
+          attachmentMode,
+        },
+        transport: { abortSignal },
+      });
+      content = response.text;
+    } else {
+      const multiRoundResult = await this.generateMultiRoundContent(
+        pdfContent,
+        isBase64,
+        itemTitle,
+        summaryMode,
+        undefined,
+        undefined,
+        undefined,
+        endpoint.id,
+        abortSignal,
+      );
+      if (!multiRoundResult.response) {
+        throw new Error("该供应商未成功完成任何一轮总结");
+      }
+      content = multiRoundResult.content;
+      response = multiRoundResult.response;
+    }
+
+    if (!content || !content.trim()) {
+      throw new Error("AI 返回内容为空");
+    }
+
+    const metadata = LLMNoteMetadataService.fromResponse("summary", response);
+    const noteHtml = this.formatNoteContent(
+      itemTitle,
+      content,
+      "AI 管家",
+      metadata,
+    );
+
+    return {
+      endpoint,
+      content,
+      response,
+      metadata,
+      noteHtml,
+    };
+  }
+
+  private static resolveEndpointAttachmentMode(
+    endpoint: LLMEndpoint,
+    pdfAttachmentMode: string,
+    prefMode: string,
+  ): "default" | "all" {
+    if (pdfAttachmentMode !== "all") return "default";
+
+    const mode = prefMode.trim().toLowerCase();
+    if (mode === "text" || mode === "mineru") return "all";
+    return LLMService.endpointSupportsMultiFile(endpoint) ? "all" : "default";
+  }
+
+  private static formatMultiModelDisplayMarkdown(
+    result: MultiModelSummaryResult,
+  ): string {
+    const model = result.response.model || result.endpoint.model || "(unknown)";
+    return [
+      `## ${result.endpoint.name}`,
+      "",
+      `供应商: ${result.endpoint.name}  模型: ${model}`,
+      "",
+      result.content,
+    ].join("\n");
   }
 
   /**
@@ -447,9 +748,10 @@ export class NoteGenerator {
     itemTitle: string,
     summary: string,
     prefix: string = "",
+    metadata?: LLMNoteMetadata | null,
   ): string {
     // 将 Markdown 转换为笔记格式的 HTML
-    const htmlContent = this.convertMarkdownToNoteHTML(summary);
+    const htmlContent = markdownToZoteroNoteHtml(summary);
 
     // 定义笔记标题中允许的文献标题最大长度,避免 Zotero 同步问题
     const maxTitleLength = 100;
@@ -466,8 +768,11 @@ export class NoteGenerator {
       : this.escapeHtml(truncatedTitle);
 
     // 添加标题头部和内容包装
-    return `<h2>${heading}</h2>
+    const noteHtml = `<h2>${heading}</h2>
 <div>${htmlContent}</div>`;
+    return metadata
+      ? LLMNoteMetadataService.wrapHtml(noteHtml, metadata)
+      : noteHtml;
   }
 
   /**
@@ -683,7 +988,9 @@ export class NoteGenerator {
     outputWindow?: SummaryView,
     progressCallback?: (message: string, progress: number) => void,
     streamCallback?: (chunk: string) => void,
-  ): Promise<string> {
+    endpointId?: string,
+    abortSignal?: LLMAbortSignal,
+  ): Promise<{ content: string; response?: LLMResponse }> {
     // 读取多轮提示词配置
     const multiRoundPromptsJson = getPref("multiRoundPrompts" as any) as string;
     const prompts = parseMultiRoundPrompts(multiRoundPromptsJson);
@@ -701,6 +1008,7 @@ export class NoteGenerator {
       role: "user" | "assistant";
       content: string;
     }> = [];
+    let lastResponse: LLMResponse | undefined;
 
     // 显示标题
     if (outputWindow) {
@@ -716,6 +1024,7 @@ export class NoteGenerator {
       const roundNum = i + 1;
       const progressPercent = 40 + Math.floor((i / totalRounds) * 40); // 40% - 80%
 
+      throwIfAborted(abortSignal);
       progressCallback?.(
         `正在进行第 ${roundNum}/${totalRounds} 轮对话: ${currentPrompt.title}`,
         progressPercent,
@@ -748,12 +1057,22 @@ export class NoteGenerator {
 
       try {
         // 调用 LLM 进行对话（带自动 API 密钥轮换）
-        const answer = await LLMClient.chatWithRetry(
-          pdfContent,
-          isBase64,
-          conversationHistory,
-          onRoundProgress,
-        );
+        const chatRequest: LLMChatRequest = {
+          content: {
+            kind: "legacy",
+            content: pdfContent,
+            isBase64,
+            policy: isBase64 ? "pdf-base64" : "text",
+          },
+          conversation: conversationHistory,
+          transport: { abortSignal },
+          onProgress: onRoundProgress,
+        };
+        const response = endpointId
+          ? await LLMService.chatWithEndpoint(endpointId, chatRequest)
+          : await LLMService.chat(chatRequest);
+        const answer = response.text;
+        lastResponse = response;
         currentAnswer = answer;
 
         // 将助手回复加入对话历史
@@ -774,6 +1093,9 @@ export class NoteGenerator {
         }
       } catch (error: any) {
         ztoolkit.log(`[AI Butler] 第 ${roundNum} 轮对话失败:`, error);
+        if (this.shouldStopMultiRoundOnError(error)) {
+          throw error;
+        }
         // 如果某轮对话失败，记录错误但继续
         roundResults.push({
           title: currentPrompt.title,
@@ -792,9 +1114,13 @@ export class NoteGenerator {
     // 根据模式生成最终内容
     if (mode === "multi_concat") {
       // 拼接模式：直接拼接所有问答
-      return this.formatMultiRoundConcat(roundResults);
+      return {
+        content: this.formatMultiRoundConcat(roundResults),
+        response: lastResponse,
+      };
     } else {
       // 总结模式：基于所有对话进行最终总结
+      throwIfAborted(abortSignal);
       progressCallback?.("正在生成最终总结...", 85);
 
       if (outputWindow) {
@@ -825,12 +1151,22 @@ export class NoteGenerator {
 
       try {
         // 调用 LLM 生成最终总结（带自动 API 密钥轮换）
-        const summary = await LLMClient.chatWithRetry(
-          pdfContent,
-          isBase64,
-          conversationHistory,
-          onFinalProgress,
-        );
+        const chatRequest: LLMChatRequest = {
+          content: {
+            kind: "legacy",
+            content: pdfContent,
+            isBase64,
+            policy: isBase64 ? "pdf-base64" : "text",
+          },
+          conversation: conversationHistory,
+          transport: { abortSignal },
+          onProgress: onFinalProgress,
+        };
+        const response = endpointId
+          ? await LLMService.chatWithEndpoint(endpointId, chatRequest)
+          : await LLMService.chat(chatRequest);
+        const summary = response.text;
+        lastResponse = response;
 
         // 检查是否需要保存中间对话内容
         const saveIntermediate =
@@ -838,16 +1174,39 @@ export class NoteGenerator {
         if (saveIntermediate) {
           // 拼接中间内容和最终总结
           const intermediateContent = this.formatMultiRoundConcat(roundResults);
-          return `${intermediateContent}\n---\n\n# 📝 最终总结\n\n${summary}`;
+          return {
+            content: `${intermediateContent}\n---\n\n# 📝 最终总结\n\n${summary}`,
+            response,
+          };
         }
 
-        return summary;
+        return { content: summary, response };
       } catch (error: any) {
         ztoolkit.log("[AI Butler] 最终总结生成失败:", error);
+        if (this.shouldStopMultiRoundOnError(error)) {
+          throw error;
+        }
         // 如果最终总结失败，回退到拼接模式
-        return this.formatMultiRoundConcat(roundResults);
+        return {
+          content: this.formatMultiRoundConcat(roundResults),
+          response: lastResponse,
+        };
       }
     }
+  }
+
+  private static shouldStopMultiRoundOnError(error: unknown): boolean {
+    const value = error as
+      | {
+          name?: string;
+          suppressTaskRetry?: boolean;
+        }
+      | undefined;
+    return (
+      value?.suppressTaskRetry === true ||
+      value?.name === "LLMApiCallError" ||
+      value?.name === "LLMApiExhaustedError"
+    );
   }
 
   /**

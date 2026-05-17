@@ -19,7 +19,7 @@
  * - SettingsView: 快捷设置面板
  *
  * 技术实现:
- * - 使用 ztoolkit.Dialog 创建对话框
+ * - 使用 ztoolkit.Dialog 创建对话框，并为当前实例绑定真实主窗口 openDialog
  * - 标签页切换显示不同视图
  * - 响应式布局适配不同窗口大小
  *
@@ -35,6 +35,11 @@ import { SettingsView } from "./SettingsView";
 import { LibraryScannerView } from "./LibraryScannerView";
 import { LiteratureReviewView } from "./LiteratureReviewView";
 import { BaseView } from "./BaseView";
+import {
+  createMainWindowScaffold,
+  type MainTabDescriptor,
+  type MainWindowScaffoldRefs,
+} from "./layout/windowScaffold";
 // 移除对窗口尺寸偏好的依赖,窗口/内容区域使用 100% 填充
 
 /**
@@ -48,6 +53,21 @@ export type TabType =
   | "scanner"
   | "literature-review";
 
+type OpenDialogWindow = Window & {
+  openDialog?: (
+    url?: string,
+    name?: string,
+    features?: string,
+    ...args: unknown[]
+  ) => Window | null;
+};
+
+type AdaptiveDialogSize = {
+  width: number;
+  height: number;
+  compact: boolean;
+};
+
 /**
  * 主窗口类
  *
@@ -57,7 +77,7 @@ export class MainWindow {
   /** 单例实例 */
   private static _instance: MainWindow | null = null;
   /** 对话框实例 */
-  private dialog: any;
+  private dialog: any = null;
 
   /** 窗口是否打开 */
   private isOpen: boolean = false;
@@ -73,6 +93,8 @@ export class MainWindow {
   private uiInitialized: boolean = false;
   /** 是否正在执行初始化，避免并发重复渲染 */
   private uiInitializing: boolean = false;
+  /** 小屏/低分辨率下使用更紧凑的主窗口布局 */
+  private useCompactLayout: boolean = false;
 
   /** 当前激活的标签页 */
   private activeTab: TabType = "dashboard";
@@ -82,6 +104,9 @@ export class MainWindow {
 
   /** 标签页按钮容器 */
   private tabBar: HTMLElement | null = null;
+
+  /** 固定式主窗口脚手架 */
+  private scaffold: MainWindowScaffoldRefs<TabType> | null = null;
 
   /** 所有视图实例 */
   private views: Map<TabType, BaseView> = new Map();
@@ -145,149 +170,277 @@ export class MainWindow {
    * @param initialTab 初始显示的标签页,默认为 dashboard
    */
   public async open(initialTab: TabType = "dashboard"): Promise<void> {
-    if (this.isOpen) {
-      // 如果窗口已打开,只切换标签页
-      this.switchTab(initialTab);
-      try {
-        this.dialog?.window?.focus?.();
-      } catch (e) {
-        ztoolkit.log("[AI Butler] 聚焦已打开窗口失败:", e);
-      }
-      return;
-    }
-
     // 防止并发重复打开
     if (this.isOpening) {
       this.activeTab = initialTab;
       return;
     }
-    this.isOpening = true;
 
+    if (this.isOpen) {
+      if (!this.isDialogActive()) {
+        this.onUnload();
+      } else {
+        // 如果窗口已打开,只切换标签页
+        this.switchTab(initialTab);
+        try {
+          this.dialog?.window?.focus?.();
+        } catch (e) {
+          ztoolkit.log("[AI Butler] 聚焦已打开窗口失败:", e);
+        }
+        return;
+      }
+    }
+
+    this.isOpening = true;
     this.activeTab = initialTab;
 
-    const dialogData: { [key: string]: any } = {
-      loadCallback: () => {
-        this.onLoad();
-        // 确保在窗口真正完成加载后再初始化 UI
-        try {
-          this.initAttempts = 0;
-          this.initializeUI();
-          // 初始化主题根类与暗色切换
+    try {
+      const dialogData: { [key: string]: any } = {
+        loadCallback: () => {
+          this.onLoad();
+          // 确保在窗口真正完成加载后再初始化 UI
           try {
-            const root = this.dialog?.window?.document?.getElementById(
-              "ai-butler-main-window",
-            );
-            if (root && !root.classList.contains("ai-butler-root")) {
-              root.classList.add("ai-butler-root");
-            }
-            let isDark = false;
-            try {
-              isDark = Services.prefs.getBoolPref("zotero.theme.dark", false);
-            } catch {
-              // Ignored
-            }
-            if (!isDark) {
-              try {
-                isDark = Services.prefs.getBoolPref(
-                  "ui.systemUsesDarkTheme",
-                  false,
-                );
-              } catch {
-                // Ignored
-              }
-            }
-            const win = Zotero.getMainWindow();
-            if (!isDark && win && typeof win.matchMedia === "function") {
-              try {
-                const mq = win.matchMedia("(prefers-color-scheme: dark)");
-                if (mq) {
-                  isDark = mq.matches;
-                }
-              } catch {
-                // Ignored
-              }
-            }
-            if (root) {
-              if (isDark) root.classList.add("ai-butler-dark");
-              else root.classList.remove("ai-butler-dark");
-            }
-          } catch (e2) {
-            ztoolkit.log("[AI Butler] 初始化主题类失败", e2);
+            this.initAttempts = 0;
+            this.initializeUI();
+            this.applyRootThemeClass();
+          } catch (e) {
+            ztoolkit.log("[AI Butler] 初始化 UI 异常:", e);
           }
-        } catch (e) {
-          ztoolkit.log("[AI Butler] 初始化 UI 异常:", e);
-        }
-      },
-      unloadCallback: () => {
-        this.onUnload();
-      },
+        },
+        unloadCallback: () => {
+          this.onUnload();
+        },
+      };
+      const dialogSize = this.getAdaptiveDialogSize();
+      this.useCompactLayout = dialogSize.compact;
+
+      this.dialog = this.createToolkitDialog(1, 1)
+        .addCell(0, 0, {
+          tag: "div",
+          id: "ai-butler-main-window",
+          styles: {
+            width: "100%",
+            height: "100%",
+            minHeight: "0",
+            overflow: "hidden",
+            position: "relative",
+            backgroundColor: "var(--ai-bg)",
+            boxSizing: "border-box",
+          },
+        })
+        .setDialogData(dialogData)
+        .open("AI Butler - 智能文献管家", {
+          width: dialogSize.width,
+          height: dialogSize.height,
+          centerscreen: true,
+          resizable: true,
+        });
+      this.isOpen = true;
+
+      // 额外兜底：某些环境下 load 可能过早触发/或渲染延迟，这里再轻量兜底一次
+      await Zotero.Promise.delay(150);
+      if (
+        this.isDialogActive() &&
+        !this.uiInitialized &&
+        (!this.tabBar || !this.viewContainer)
+      ) {
+        this.initAttempts = 0;
+        this.initializeUI();
+      }
+    } catch (error) {
+      this.cleanupFailedOpen();
+      throw error;
+    } finally {
+      this.isOpening = false;
+    }
+  }
+
+  /**
+   * 为当前 Dialog 实例绑定 openDialog，避免 toolkit 取出方法后脱离 Window 调用。
+   */
+  private createToolkitDialog(row: number, column: number): any {
+    const opener = this.getOpenDialogHost();
+    const dialog = new ztoolkit.Dialog(row, column) as any;
+    const originalGetGlobal =
+      typeof dialog.getGlobal === "function"
+        ? dialog.getGlobal.bind(dialog)
+        : null;
+
+    dialog.getGlobal = (key: string) => {
+      if (key === "openDialog") {
+        return opener.openDialog!.bind(opener);
+      }
+      return originalGetGlobal ? originalGetGlobal(key) : undefined;
     };
 
-    // 创建对话框（使用固定默认尺寸，内部容器100%填充）
-    const defaultW = 950;
-    const defaultH = 750;
+    return dialog;
+  }
 
-    this.dialog = new ztoolkit.Dialog(1, 1)
-      .addCell(0, 0, {
-        tag: "div",
-        id: "ai-butler-main-window",
-        styles: {
-          width: "100%",
-          height: "100%",
-          display: "flex",
-          flexDirection: "column",
-          fontFamily: "system-ui, -apple-system, sans-serif",
-          backgroundColor: "var(--ai-bg)",
-        },
-        children: [
-          // 标签页导航栏
-          {
-            tag: "div",
-            id: "tab-bar",
-            styles: {
-              display: "flex",
-              backgroundColor: "var(--ai-surface)",
-              borderBottom: "2px solid var(--ai-border)",
-              flexShrink: "0",
-            },
-          },
-          // 视图容器
-          {
-            tag: "div",
-            id: "view-container",
-            styles: {
-              flex: "1",
-              overflow: "hidden",
-              backgroundColor: "var(--ai-surface)",
-              // 移除 position: relative，让子视图使用正常布局
-              display: "flex",
-              flexDirection: "column",
-            },
-          },
-        ],
-      })
-      .setDialogData(dialogData)
-      .open("AI Butler - 智能文献管家", {
-        width: defaultW,
-        height: defaultH,
-        centerscreen: true,
-        resizable: true,
-      });
+  private getOpenDialogHost(): OpenDialogWindow {
+    const mainWindow = Zotero.getMainWindow();
+    const opener = (mainWindow.document?.defaultView ||
+      mainWindow) as OpenDialogWindow;
 
-    this.isOpen = true;
-    this.isOpening = false;
-
-    // 额外兜底：某些环境下 loadCallback 可能过早触发/或渲染延迟，这里再轻量兜底一次
-    await Zotero.Promise.delay(150);
-    if (
-      this.dialog &&
-      this.dialog.window &&
-      !this.uiInitialized &&
-      (!this.tabBar || !this.viewContainer)
-    ) {
-      this.initAttempts = 0;
-      this.initializeUI();
+    if (!opener || typeof opener.openDialog !== "function") {
+      const error = new Error(
+        "Cannot open AI Butler window: openDialog is not available on Zotero main window",
+      );
+      ztoolkit.log("[AI Butler] 打开主窗口失败:", error);
+      throw error;
     }
+
+    return opener;
+  }
+
+  private getAdaptiveDialogSize(): AdaptiveDialogSize {
+    const { width: screenWidth, height: screenHeight } =
+      this.getAvailableScreenSize();
+    const lowResolution = screenWidth <= 1440 || screenHeight <= 900;
+    const targetWidth = lowResolution ? 820 : 950;
+    const targetHeight = lowResolution ? 560 : 750;
+    const horizontalMargin = lowResolution ? 96 : 160;
+    const verticalMargin = lowResolution ? 128 : 160;
+    const width = this.clampDialogDimension(
+      screenWidth,
+      targetWidth,
+      horizontalMargin,
+      640,
+    );
+    const height = this.clampDialogDimension(
+      screenHeight,
+      targetHeight,
+      verticalMargin,
+      460,
+    );
+
+    return {
+      width,
+      height,
+      compact: lowResolution || width < 900 || height < 700,
+    };
+  }
+
+  private getAvailableScreenSize(): { width: number; height: number } {
+    const fallback = { width: 1280, height: 800 };
+    try {
+      const mainWindow = Zotero.getMainWindow() as Window | null;
+      const screenInfo = mainWindow?.screen;
+      const width =
+        this.getPositiveNumber(screenInfo?.availWidth) ||
+        this.getPositiveNumber(screenInfo?.width) ||
+        fallback.width;
+      const height =
+        this.getPositiveNumber(screenInfo?.availHeight) ||
+        this.getPositiveNumber(screenInfo?.height) ||
+        fallback.height;
+      return { width, height };
+    } catch {
+      return fallback;
+    }
+  }
+
+  private getPositiveNumber(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? value
+      : 0;
+  }
+
+  private clampDialogDimension(
+    available: number,
+    target: number,
+    margin: number,
+    minimum: number,
+  ): number {
+    const safeMaximum = Math.max(
+      Math.min(minimum, available),
+      available - margin,
+    );
+    return Math.round(Math.min(target, safeMaximum));
+  }
+
+  private applyRootThemeClass(): void {
+    try {
+      const root = this.dialog?.window.document.getElementById(
+        "ai-butler-main-window",
+      );
+      if (root && !root.classList.contains("ai-butler-root")) {
+        root.classList.add("ai-butler-root");
+      }
+
+      let isDark = false;
+      try {
+        isDark = Services.prefs.getBoolPref("zotero.theme.dark", false);
+      } catch {
+        // Ignored
+      }
+      if (!isDark) {
+        try {
+          isDark = Services.prefs.getBoolPref("ui.systemUsesDarkTheme", false);
+        } catch {
+          // Ignored
+        }
+      }
+
+      const win = Zotero.getMainWindow();
+      if (!isDark && win && typeof win.matchMedia === "function") {
+        try {
+          const mq = win.matchMedia("(prefers-color-scheme: dark)");
+          if (mq) {
+            isDark = mq.matches;
+          }
+        } catch {
+          // Ignored
+        }
+      }
+
+      if (root) {
+        root.classList.toggle("ai-butler-compact", this.useCompactLayout);
+        if (isDark) root.classList.add("ai-butler-dark");
+        else root.classList.remove("ai-butler-dark");
+      }
+    } catch (e) {
+      ztoolkit.log("[AI Butler] 初始化主题类失败", e);
+    }
+  }
+
+  private cleanupFailedOpen(): void {
+    const dialog = this.dialog;
+    this.dialog = null;
+    this.isOpen = false;
+    this.resetUIState();
+
+    if (this.isDialogHandleActive(dialog)) {
+      try {
+        dialog.window.close();
+      } catch (e) {
+        ztoolkit.log("[AI Butler] 清理失败的主窗口时关闭窗口失败:", e);
+      }
+    }
+  }
+
+  private isDialogActive(): boolean {
+    return this.isDialogHandleActive(this.dialog);
+  }
+
+  private isDialogHandleActive(dialog: any): boolean {
+    try {
+      return !!dialog?.window && !dialog.window.closed;
+    } catch {
+      return false;
+    }
+  }
+
+  private resetUIState(): void {
+    this.uiInitialized = false;
+    this.uiInitializing = false;
+    this.initAttempts = 0;
+    this.tabBar = null;
+    this.viewContainer = null;
+    this.scaffold = null;
+
+    this.views.forEach((view) => {
+      view.destroy();
+    });
   }
 
   /**
@@ -300,13 +453,22 @@ export class MainWindow {
     if (this.uiInitialized || this.uiInitializing) return;
     this.uiInitializing = true;
 
-    const doc = this.dialog.window.document;
-    const tryInit = () => {
-      // 获取容器引用
-      this.tabBar = doc.getElementById("tab-bar");
-      this.viewContainer = doc.getElementById("view-container");
+    const dialog = this.dialog;
+    if (!this.isDialogHandleActive(dialog)) {
+      this.uiInitializing = false;
+      return;
+    }
 
-      if (!this.tabBar || !this.viewContainer) {
+    const doc = dialog.window.document;
+    const tryInit = () => {
+      if (this.dialog !== dialog || !this.isDialogHandleActive(dialog)) {
+        this.uiInitializing = false;
+        return;
+      }
+
+      const host = doc.getElementById("ai-butler-main-window") as HTMLElement;
+
+      if (!host) {
         // 如果容器还未渲染出来，重试；达到上限后进行兜底创建
         if (this.initAttempts < this.maxInitAttempts) {
           this.initAttempts++;
@@ -314,51 +476,29 @@ export class MainWindow {
           return;
         }
 
-        // 兜底：手动创建缺失的容器，避免出现空白窗口
-        const root = doc.getElementById("ai-butler-main-window");
-        if (root) {
-          if (!this.tabBar) {
-            const tab = doc.createElement("div");
-            tab.id = "tab-bar";
-            Object.assign(tab.style, {
-              display: "flex",
-              backgroundColor: "#fff",
-              borderBottom: "2px solid #e0e0e0",
-              flexShrink: "0",
-            } as Partial<CSSStyleDeclaration>);
-            root.appendChild(tab);
-            this.tabBar = tab;
-          }
-          if (!this.viewContainer) {
-            const container = doc.createElement("div");
-            container.id = "view-container";
-            Object.assign(container.style, {
-              flex: "1",
-              overflow: "hidden",
-              backgroundColor: "#fff",
-              display: "flex",
-              flexDirection: "column",
-            } as Partial<CSSStyleDeclaration>);
-            root.appendChild(container);
-            this.viewContainer = container;
-          }
-          ztoolkit.log("[AI Butler] 容器未按时渲染，已兜底创建");
-        } else {
-          ztoolkit.log("[AI Butler] 无法找到容器元素");
-        }
-      }
-
-      if (!this.tabBar || !this.viewContainer) {
-        // 兜底后仍失败，结束本次初始化尝试
+        ztoolkit.log("[AI Butler] 无法找到主窗口脚手架宿主元素");
         this.uiInitializing = false;
         return;
       }
 
+      host.classList.add("ai-butler-root");
+      host.classList.toggle("ai-butler-compact", this.useCompactLayout);
+
       // 注入 CSS（只在首次完成时执行）
       this.injectStyles();
 
-      // 创建标签页按钮（只在首次完成时执行）
-      this.createTabButtons();
+      // 创建冻结式窗口脚手架
+      const tabs: Array<MainTabDescriptor<TabType>> = [
+        { id: "dashboard", label: "仪表盘", icon: "📊" },
+        { id: "summary", label: "AI 总结", icon: "📝" },
+        { id: "tasks", label: "任务队列", icon: "📋" },
+        { id: "settings", label: "快捷设置", icon: "⚙️" },
+      ];
+      this.scaffold = createMainWindowScaffold(host, tabs, (tabId) => {
+        this.switchTab(tabId);
+      });
+      this.tabBar = this.scaffold.topNav;
+      this.viewContainer = this.scaffold.viewPort;
 
       // 渲染所有视图（只在首次完成时执行）
       this.renderViews();
@@ -382,77 +522,37 @@ export class MainWindow {
    * @private
    */
   private injectStyles(): void {
-    if (!this.dialog || !this.dialog.window) return;
+    if (!this.isDialogActive()) return;
     const doc = this.dialog.window.document;
+    const documentElement = doc.documentElement as HTMLElement | null;
+    if (documentElement) {
+      documentElement.style.height = "100%";
+    }
+    if (doc.body) {
+      doc.body.style.height = "100%";
+      doc.body.style.margin = "0";
+    }
+    let head = doc.head;
+    if (!head && documentElement) {
+      head = doc.createElement("head");
+      documentElement.insertBefore(
+        head,
+        doc.body || documentElement.firstChild,
+      );
+    }
+    if (!head) return;
+
     const baseLink = doc.createElement("link");
     baseLink.rel = "stylesheet";
     baseLink.href = `chrome://${config.addonRef}/content/outputWindow.css`;
-    doc.head.appendChild(baseLink);
+    head.appendChild(baseLink);
     if (!doc.getElementById("ai-butler-theme-css")) {
       const themeLink = doc.createElement("link");
       themeLink.id = "ai-butler-theme-css";
       themeLink.rel = "stylesheet";
       themeLink.href = `chrome://${config.addonRef}/content/aiButlerTheme.css`;
-      doc.head.appendChild(themeLink);
+      head.appendChild(themeLink);
     }
-  }
-
-  /**
-   * 创建标签页按钮
-   *
-   * @private
-   */
-  private createTabButtons(): void {
-    if (!this.tabBar) return;
-
-    const tabs: Array<{ id: TabType; label: string; icon: string }> = [
-      { id: "dashboard", label: "仪表盘", icon: "📊" },
-      { id: "summary", label: "AI 总结", icon: "📝" },
-      { id: "tasks", label: "任务队列", icon: "📋" },
-      { id: "settings", label: "快捷设置", icon: "⚙️" },
-    ];
-
-    tabs.forEach((tab) => {
-      const button = this.dialog.window.document.createElement("button");
-      button.id = `tab-${tab.id}`;
-      button.className = "tab-button";
-      button.innerHTML = `${tab.icon} ${tab.label}`;
-
-      Object.assign(button.style, {
-        flex: "1",
-        padding: "12px 20px", // 恢复均衡的内边距
-        border: "none",
-        backgroundColor: "transparent",
-        color: "var(--ai-text-muted)",
-        fontSize: "14px",
-        fontWeight: "600",
-        cursor: "pointer",
-        transition: "all 0.2s",
-        borderBottom: "3px solid transparent",
-        display: "flex", // 使用 flex 布局
-        alignItems: "center", // 垂直居中
-        justifyContent: "center", // 水平居中
-        boxSizing: "border-box", // 包含边框在内的盒模型
-      });
-
-      button.addEventListener("click", () => {
-        this.switchTab(tab.id);
-      });
-
-      button.addEventListener("mouseenter", () => {
-        if (this.activeTab !== tab.id) {
-          button.style.backgroundColor = "var(--ai-accent-tint)";
-        }
-      });
-
-      button.addEventListener("mouseleave", () => {
-        if (this.activeTab !== tab.id) {
-          button.style.backgroundColor = "transparent";
-        }
-      });
-
-      this.tabBar!.appendChild(button);
-    });
   }
 
   /**
@@ -463,13 +563,14 @@ export class MainWindow {
   private renderViews(): void {
     if (!this.viewContainer) return;
 
-    this.views.forEach((view, key) => {
+    this.views.forEach((view) => {
       const viewElement = view.render();
-      // 使用 flex 布局而非 absolute 定位，让滚动正常工作
+      // 页面层绝对定位，避免内容高度推动顶部导航或窗口外层滚动
+      viewElement.style.position = "absolute";
+      viewElement.style.inset = "0";
       viewElement.style.width = "100%";
       viewElement.style.height = "100%";
-      viewElement.style.flex = "1";
-      viewElement.style.minHeight = "0"; // 关键：允许 flex 子元素正确计算滚动高度
+      viewElement.style.minHeight = "0";
       viewElement.style.display = "none"; // 初始隐藏
       this.viewContainer!.appendChild(viewElement);
     });
@@ -494,10 +595,9 @@ export class MainWindow {
     this.activeTab = tabId;
 
     // 如果是 scanner 或 literature-review 视图,隐藏标签栏
-    if (this.tabBar) {
-      this.tabBar.style.display =
-        tabId === "scanner" || tabId === "literature-review" ? "none" : "flex";
-    }
+    this.scaffold?.setMainNavVisible(
+      tabId !== "scanner" && tabId !== "literature-review",
+    );
 
     // 更新标签按钮样式
     this.updateTabButtons();
@@ -518,25 +618,7 @@ export class MainWindow {
    * @private
    */
   private updateTabButtons(): void {
-    if (!this.tabBar) return;
-
-    const buttons = this.tabBar.querySelectorAll(".tab-button");
-    buttons.forEach((button: Element) => {
-      const btn = button as HTMLElement;
-      const tabId = btn.id.replace("tab-", "") as TabType;
-
-      if (tabId === this.activeTab) {
-        btn.style.color = "var(--ai-accent)";
-        btn.style.backgroundColor = "var(--ai-accent-tint)";
-        btn.style.borderBottomColor = "var(--ai-accent)";
-        btn.classList.add("active");
-      } else {
-        btn.style.color = "var(--ai-text-muted)";
-        btn.style.backgroundColor = "transparent";
-        btn.style.borderBottomColor = "transparent";
-        btn.classList.remove("active");
-      }
-    });
+    this.scaffold?.setActiveTab(this.activeTab);
   }
 
   /**
@@ -545,7 +627,7 @@ export class MainWindow {
    * @private
    */
   private showPlaceholder(tabId: TabType): void {
-    if (!this.viewContainer) return;
+    if (!this.viewContainer || !this.isDialogActive()) return;
 
     // 隐藏所有视图
     this.views.forEach((view) => view.hide());
@@ -583,7 +665,7 @@ export class MainWindow {
    */
   public close(): void {
     if (this.dialog) {
-      this.dialog.window.close();
+      this.dialog.window?.close?.();
     }
   }
 
@@ -604,18 +686,8 @@ export class MainWindow {
   private onUnload(): void {
     this.isOpen = false;
     this.isOpening = false;
-
-    // 重置初始化相关状态，防止下次打开复用旧引用
-    this.uiInitialized = false;
-    this.uiInitializing = false;
-    this.initAttempts = 0;
-    this.tabBar = null;
-    this.viewContainer = null;
-
-    // 销毁所有视图
-    this.views.forEach((view) => {
-      view.destroy();
-    });
+    this.dialog = null;
+    this.resetUIState();
 
     ztoolkit.log("[AI Butler] 主窗口已关闭");
   }
@@ -653,7 +725,7 @@ export class MainWindow {
    * @returns 是否打开
    */
   public isWindowOpen(): boolean {
-    return this.isOpen;
+    return this.isOpen && this.isDialogActive();
   }
 
   /**

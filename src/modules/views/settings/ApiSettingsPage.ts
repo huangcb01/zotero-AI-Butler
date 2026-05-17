@@ -14,15 +14,18 @@ import {
   createInput,
   createSelect,
 } from "../ui/components";
+import { EndpointSettingsPanel } from "../ui/EndpointSettingsPanel";
 import LLMClient from "../../llmClient";
-import { APITestError } from "../../llmproviders/types";
+import type { LLMModelInfo, LLMOptions } from "../../llmproviders/types";
 import { ApiKeyManager, type ProviderId } from "../../apiKeyManager";
+import { LLMEndpointManager } from "../../llmEndpointManager";
 
 /**
  * API 设置页面类
  */
 export class ApiSettingsPage {
   private container: HTMLElement;
+  private endpointPreviewUpdaters: Array<() => void> = [];
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -33,10 +36,11 @@ export class ApiSettingsPage {
    */
   public render(): void {
     this.container.innerHTML = "";
+    this.endpointPreviewUpdaters = [];
 
     // 标题
     const title = this.createElement("h2", {
-      textContent: "🔌 API 配置",
+      textContent: "🔌 模型平台配置",
       styles: {
         color: "#59c0bc",
         marginBottom: "20px",
@@ -59,15 +63,25 @@ export class ApiSettingsPage {
         color: "#1565c0",
       },
     });
-    const doc = Zotero.getMainWindow().document;
     notice.innerHTML =
       "📝 <strong>说明</strong>: 标有 <strong style='color: #d32f2f;'>*</strong> 的字段为必填项";
     this.container.appendChild(notice);
+
+    const endpointPanel = new EndpointSettingsPanel({
+      modalHost: this.container,
+      onChange: () => this.refreshEndpointPreviews(),
+    });
+    this.container.appendChild(endpointPanel.getElement());
 
     // 表单容器
     const form = this.createElement("div", {
       styles: {
         maxWidth: "800px",
+      },
+    });
+    const legacyProviderForm = this.createElement("div", {
+      styles: {
+        display: "none",
       },
     });
 
@@ -85,6 +99,7 @@ export class ApiSettingsPage {
         { value: "anthropic", label: "Anthropic Claude" },
         { value: "openrouter", label: "OpenRouter" },
         { value: "volcanoark", label: "火山方舟 (Volcano Ark)" },
+        { value: "ollama", label: "Ollama" },
       ],
       providerValue,
       (newVal) => {
@@ -168,9 +183,29 @@ export class ApiSettingsPage {
             modelInput.value = "doubao-seed-1-8-251228";
           }
         }
+        // 若切换到 Ollama 且未填写，填充本地默认
+        if (newVal === "ollama") {
+          const curUrl = (getPref("ollamaApiUrl") as string) || "";
+          const urlInput = this.container.querySelector(
+            "#setting-ollamaApiUrl",
+          ) as HTMLInputElement;
+          const modelInput = this.container.querySelector(
+            "#setting-ollamaModel",
+          ) as HTMLInputElement;
+          if (urlInput && (!curUrl || urlInput.value.trim() === "")) {
+            urlInput.value = "http://localhost:11434";
+          }
+          if (
+            modelInput &&
+            (!modelInput.value || modelInput.value.trim() === "")
+          ) {
+            modelInput.value = "llama3.2";
+          }
+        }
+        this.refreshEndpointPreviews();
       },
     );
-    form.appendChild(
+    legacyProviderForm.appendChild(
       this.createFormGroup(
         "API 提供商",
         providerSelect,
@@ -193,18 +228,21 @@ export class ApiSettingsPage {
     const sectionVolcanoArk = this.createElement("div", {
       id: "provider-volcanoark",
     });
+    const sectionOllama = this.createElement("div", {
+      id: "provider-ollama",
+    });
 
     // OpenAI 字段（Responses 新接口）
     sectionOpenAI.appendChild(
-      this.createFormGroup(
+      this.createEndpointFormGroup(
         "API 地址 *",
-        this.createInput(
-          "openaiApiUrl",
-          "text",
-          getPref("openaiApiUrl") as string,
-          "https://api.openai.com/v1/responses",
-        ),
-        "【必填】OpenAI官方最新地址：https://api.openai.com/v1/responses",
+        "openaiApiUrl",
+        getPref("openaiApiUrl") as string,
+        "https://api.openai.com/v1/responses",
+        {
+          officialEndpoint: "https://api.openai.com/v1/responses",
+          previewKind: "openaiResponses",
+        },
       ),
     );
     sectionOpenAI.appendChild(
@@ -221,14 +259,12 @@ export class ApiSettingsPage {
       ),
     );
     sectionOpenAI.appendChild(
-      this.createFormGroup(
+      this.createModelFormGroup(
         "模型 *",
-        this.createInput(
-          "openaiApiModel",
-          "text",
-          getPref("openaiApiModel") as string,
-          "gpt-5",
-        ),
+        "openai",
+        "openaiApiModel",
+        getPref("openaiApiModel") as string,
+        "gpt-5",
         "【必填】要使用的模型名称",
       ),
     );
@@ -251,16 +287,16 @@ export class ApiSettingsPage {
 
     // OpenAI 兼容（旧 Chat Completions / 第三方）字段
     sectionOpenAICompat.appendChild(
-      this.createFormGroup(
+      this.createEndpointFormGroup(
         "兼容 API 地址 *",
-        this.createInput(
-          "openaiCompatApiUrl",
-          "text",
-          (getPref("openaiCompatApiUrl") as string) ||
-            "https://api.openai.com/v1/chat/completions",
+        "openaiCompatApiUrl",
+        (getPref("openaiCompatApiUrl") as string) ||
           "https://api.openai.com/v1/chat/completions",
-        ),
-        "【必填】旧版 Chat Completions 完整端点。例如 SiliconFlow: https://api.siliconflow.cn/v1/chat/completions",
+        "https://api.openai.com/v1/chat/completions",
+        {
+          officialEndpoint: "https://api.openai.com/v1/chat/completions",
+          previewKind: "chatCompletions",
+        },
       ),
     );
     sectionOpenAICompat.appendChild(
@@ -278,16 +314,14 @@ export class ApiSettingsPage {
       ),
     );
     sectionOpenAICompat.appendChild(
-      this.createFormGroup(
+      this.createModelFormGroup(
         "兼容模型 *",
-        this.createInput(
-          "openaiCompatModel",
-          "text",
-          (getPref("openaiCompatModel") as string) ||
-            (getPref("openaiApiModel") as string) ||
-            "gpt-3.5-turbo",
+        "openai-compat",
+        "openaiCompatModel",
+        (getPref("openaiCompatModel") as string) ||
+          (getPref("openaiApiModel") as string) ||
           "gpt-3.5-turbo",
-        ),
+        "gpt-3.5-turbo",
         "【必填】第三方提供的模型名称，如 Qwen/QwQ-32B、deepseek-ai/DeepSeek-V3 等",
       ),
     );
@@ -308,15 +342,16 @@ export class ApiSettingsPage {
 
     // Gemini 字段
     sectionGemini.appendChild(
-      this.createFormGroup(
+      this.createEndpointFormGroup(
         "API 基础地址 *",
-        this.createInput(
-          "geminiApiUrl",
-          "text",
-          getPref("geminiApiUrl") as string,
-          "https://generativelanguage.googleapis.com",
-        ),
-        "【必填】将以 /v1beta/models/{模型名}:streamGenerateContent?alt=sse 调用",
+        "geminiApiUrl",
+        getPref("geminiApiUrl") as string,
+        "https://generativelanguage.googleapis.com",
+        {
+          officialEndpoint: "https://generativelanguage.googleapis.com",
+          previewKind: "geminiStream",
+          modelInputId: "geminiModel",
+        },
       ),
     );
     sectionGemini.appendChild(
@@ -333,29 +368,27 @@ export class ApiSettingsPage {
       ),
     );
     sectionGemini.appendChild(
-      this.createFormGroup(
+      this.createModelFormGroup(
         "模型 *",
-        this.createInput(
-          "geminiModel",
-          "text",
-          getPref("geminiModel") as string,
-          "gemini-2.5-pro",
-        ),
+        "google",
+        "geminiModel",
+        getPref("geminiModel") as string,
+        "gemini-2.5-pro",
         "【必填】Gemini 模型名称, 如 gemini-2.5-pro",
       ),
     );
 
     // Anthropic 字段
     sectionAnthropic.appendChild(
-      this.createFormGroup(
+      this.createEndpointFormGroup(
         "API 基础地址 *",
-        this.createInput(
-          "anthropicApiUrl",
-          "text",
-          getPref("anthropicApiUrl") as string,
-          "https://api.anthropic.com",
-        ),
-        "【必填】Anthropic API 基础地址",
+        "anthropicApiUrl",
+        getPref("anthropicApiUrl") as string,
+        "https://api.anthropic.com",
+        {
+          officialEndpoint: "https://api.anthropic.com",
+          previewKind: "anthropicMessages",
+        },
       ),
     );
     sectionAnthropic.appendChild(
@@ -372,29 +405,27 @@ export class ApiSettingsPage {
       ),
     );
     sectionAnthropic.appendChild(
-      this.createFormGroup(
+      this.createModelFormGroup(
         "模型 *",
-        this.createInput(
-          "anthropicModel",
-          "text",
-          getPref("anthropicModel") as string,
-          "claude-3-5-sonnet-20241022",
-        ),
+        "anthropic",
+        "anthropicModel",
+        getPref("anthropicModel") as string,
+        "claude-3-5-sonnet-20241022",
         "【必填】Claude 模型名称, 如 claude-3-5-sonnet-20241022",
       ),
     );
 
     // OpenRouter 字段
     sectionOpenRouter.appendChild(
-      this.createFormGroup(
+      this.createEndpointFormGroup(
         "API 基础地址 *",
-        this.createInput(
-          "openRouterApiUrl",
-          "text",
-          getPref("openRouterApiUrl") as string,
-          "https://openrouter.ai/api/v1/chat/completions",
-        ),
-        "【必填】OpenRouter API 基础地址",
+        "openRouterApiUrl",
+        getPref("openRouterApiUrl") as string,
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+          officialEndpoint: "https://openrouter.ai/api/v1/chat/completions",
+          previewKind: "chatCompletions",
+        },
       ),
     );
     sectionOpenRouter.appendChild(
@@ -411,29 +442,28 @@ export class ApiSettingsPage {
       ),
     );
     sectionOpenRouter.appendChild(
-      this.createFormGroup(
+      this.createModelFormGroup(
         "模型 *",
-        this.createInput(
-          "openRouterModel",
-          "text",
-          getPref("openRouterModel") as string,
-          "google/gemma-3-27b-it",
-        ),
+        "openrouter",
+        "openRouterModel",
+        getPref("openRouterModel") as string,
+        "google/gemma-3-27b-it",
         "【必填】OpenRouter 模型名称, 如 google/gemma-3-27b-it",
       ),
     );
 
     // 火山方舟字段
     sectionVolcanoArk.appendChild(
-      this.createFormGroup(
+      this.createEndpointFormGroup(
         "API 地址 *",
-        this.createInput(
-          "volcanoArkApiUrl",
-          "text",
-          getPref("volcanoArkApiUrl") as string,
-          "https://ark.cn-beijing.volces.com/api/v3/responses",
-        ),
-        "【必填】火山方舟 API 完整地址（使用 Responses API）",
+        "volcanoArkApiUrl",
+        getPref("volcanoArkApiUrl") as string,
+        "https://ark.cn-beijing.volces.com/api/v3/responses",
+        {
+          officialEndpoint:
+            "https://ark.cn-beijing.volces.com/api/v3/responses",
+          previewKind: "volcanoResponses",
+        },
       ),
     );
     sectionVolcanoArk.appendChild(
@@ -450,14 +480,12 @@ export class ApiSettingsPage {
       ),
     );
     sectionVolcanoArk.appendChild(
-      this.createFormGroup(
+      this.createModelFormGroup(
         "模型 *",
-        this.createInput(
-          "volcanoArkModel",
-          "text",
-          getPref("volcanoArkModel") as string,
-          "doubao-seed-1-8-251228",
-        ),
+        "volcanoark",
+        "volcanoArkModel",
+        getPref("volcanoArkModel") as string,
+        "doubao-seed-1-8-251228",
         "【必填】豆包大模型名称, 如 doubao-seed-1-8-251228",
       ),
     );
@@ -477,12 +505,64 @@ export class ApiSettingsPage {
     });
     sectionVolcanoArk.appendChild(volcanoArkNote);
 
-    form.appendChild(sectionOpenAI);
-    form.appendChild(sectionOpenAICompat);
-    form.appendChild(sectionGemini);
-    form.appendChild(sectionAnthropic);
-    form.appendChild(sectionOpenRouter);
-    form.appendChild(sectionVolcanoArk);
+    // Ollama 字段
+    sectionOllama.appendChild(
+      this.createEndpointFormGroup(
+        "API 基础地址 *",
+        "ollamaApiUrl",
+        getPref("ollamaApiUrl") as string,
+        "http://localhost:11434",
+        {
+          officialEndpoint: "http://localhost:11434/api/chat",
+          previewKind: "ollamaChat",
+        },
+      ),
+    );
+    sectionOllama.appendChild(
+      this.createFormGroup(
+        "API 密钥",
+        this.createPasswordInput(
+          "ollamaApiKey",
+          getPref("ollamaApiKey") as string,
+          "可留空",
+          "ollama",
+        ),
+        "Ollama 本地服务通常无需 API 密钥；如果你的服务设置了鉴权，可填写 Bearer token。",
+        "ollama",
+      ),
+    );
+    sectionOllama.appendChild(
+      this.createModelFormGroup(
+        "模型 *",
+        "ollama",
+        "ollamaModel",
+        getPref("ollamaModel") as string,
+        "llama3.2",
+        "【必填】本地 Ollama 模型名称, 如 llama3.2、qwen2.5:7b、deepseek-r1:8b",
+      ),
+    );
+    const ollamaNote = this.createElement("div", {
+      innerHTML:
+        "<strong>说明</strong>：Ollama 使用原生 <code>/api/chat</code> 接口，默认地址为 <code>http://localhost:11434</code>。Ollama 不支持直接上传 PDF Base64；请在 PDF 处理配置中选择“文本提取”或“MinerU”。",
+      styles: {
+        padding: "10px 12px",
+        backgroundColor: "#e8f5e9",
+        border: "1px solid #a5d6a7",
+        borderRadius: "6px",
+        color: "#2e7d32",
+        fontSize: "13px",
+        marginBottom: "16px",
+      },
+    });
+    sectionOllama.appendChild(ollamaNote);
+
+    legacyProviderForm.appendChild(sectionOpenAI);
+    legacyProviderForm.appendChild(sectionOpenAICompat);
+    legacyProviderForm.appendChild(sectionGemini);
+    legacyProviderForm.appendChild(sectionAnthropic);
+    legacyProviderForm.appendChild(sectionOpenRouter);
+    legacyProviderForm.appendChild(sectionVolcanoArk);
+    legacyProviderForm.appendChild(sectionOllama);
 
     const renderProviderSections = (prov: string) => {
       const isGemini = prov === "google";
@@ -490,12 +570,14 @@ export class ApiSettingsPage {
       const isOpenRouter = prov === "openrouter";
       const isOpenAICompat = prov === "openai-compat";
       const isVolcanoArk = prov === "volcanoark";
+      const isOllama = prov === "ollama";
       (sectionOpenAI as HTMLElement).style.display =
         isGemini ||
         isAnthropic ||
         isOpenAICompat ||
         isOpenRouter ||
-        isVolcanoArk
+        isVolcanoArk ||
+        isOllama
           ? "none"
           : "block";
       (sectionOpenAICompat as HTMLElement).style.display = isOpenAICompat
@@ -513,8 +595,12 @@ export class ApiSettingsPage {
       (sectionVolcanoArk as HTMLElement).style.display = isVolcanoArk
         ? "block"
         : "none";
+      (sectionOllama as HTMLElement).style.display = isOllama
+        ? "block"
+        : "none";
     };
     renderProviderSections(providerValue);
+    form.appendChild(legacyProviderForm);
 
     // Temperature 参数（可选启用）
     const tempContainer = this.createElement("div", {
@@ -717,70 +803,6 @@ export class ApiSettingsPage {
       ),
     );
 
-    // === API 轮换配置分隔线 ===
-    const rotationTitle = this.createElement("h3", {
-      textContent: "🔄 API 轮换配置",
-      styles: {
-        color: "#9c27b0",
-        marginTop: "40px",
-        marginBottom: "20px",
-        fontSize: "18px",
-        borderBottom: "2px solid #9c27b0",
-        paddingBottom: "8px",
-      },
-    });
-    form.appendChild(rotationTitle);
-
-    // API 轮换说明
-    const rotationNote = this.createElement("div", {
-      innerHTML:
-        "ℹ️ <strong>说明</strong>：配置备用 API 密钥后，当主密钥调用失败时会自动切换到备用密钥继续执行，提高任务成功率。",
-      styles: {
-        padding: "10px 12px",
-        backgroundColor: "#f3e5f5",
-        border: "1px solid #ce93d8",
-        borderRadius: "6px",
-        color: "#6a1b9a",
-        fontSize: "13px",
-        marginBottom: "16px",
-      },
-    });
-    form.appendChild(rotationNote);
-
-    // 最大切换次数
-    form.appendChild(
-      this.createFormGroup(
-        "最大切换次数",
-        this.createInput(
-          "maxApiSwitchCount",
-          "number",
-          (getPref("maxApiSwitchCount" as any) as string) || "3",
-          "3",
-        ),
-        "API 调用失败时最多切换密钥的次数，默认 3 次",
-      ),
-    );
-
-    // 失败冷却时间
-    form.appendChild(
-      this.createFormGroup(
-        "失败冷却时间(秒)",
-        this.createInput(
-          "failedKeyCooldownSeconds",
-          "number",
-          String(
-            Math.floor(
-              (parseInt(
-                (getPref("failedKeyCooldown" as any) as string) || "300000",
-              ) || 300000) / 1000,
-            ),
-          ),
-          "300",
-        ),
-        "失败的密钥需要冷却多久才能再次使用，默认 300 秒 (5分钟)",
-      ),
-    );
-
     // === PDF 处理配置分隔线 ===
     const pdfTitle = this.createElement("h3", {
       textContent: "📄 PDF 处理配置",
@@ -856,6 +878,29 @@ export class ApiSettingsPage {
       "mineruApiKey",
       (getPref("mineruApiKey") as string) || "",
       "配置以启用高质量公式与表格识别...",
+    );
+    const mineruModelVersion = String(getPref("mineruModelVersion") || "vlm");
+    const mineruModelSelect = createSelect(
+      "mineruModelVersion",
+      [
+        { value: "vlm", label: "VLM（推荐，高质量解析）" },
+        { value: "pipeline", label: "Pipeline（轻量模型）" },
+      ],
+      mineruModelVersion === "pipeline" ? "pipeline" : "vlm",
+      (newVal) => {
+        setPref(
+          "mineruModelVersion",
+          newVal === "pipeline" ? "pipeline" : "vlm",
+        );
+      },
+    );
+
+    sectionMineru.appendChild(
+      this.createFormGroup(
+        "MinerU 模型版本",
+        mineruModelSelect,
+        "VLM 解析质量更高；Pipeline 更轻量，适合速度优先或额度敏感的场景。",
+      ),
     );
 
     // 手动绑定保存事件，因为 createPasswordInput 只有存在 providerId 时才自动保存
@@ -972,7 +1017,7 @@ export class ApiSettingsPage {
       this.createFormGroup(
         "多 PDF 附件模式",
         pdfAttachmentModeSelect,
-        "当论文有多个 PDF 附件时的处理方式。全部 PDF 模式仅支持 Gemini，其他提供商将自动回退到默认模式",
+        "当论文有多个 PDF 附件时的处理方式。选择“全部 PDF”时会使用当前 Provider 的多 PDF 上传能力；具体可用性取决于所选模型和服务端是否支持 PDF 输入",
       ),
     );
 
@@ -986,11 +1031,6 @@ export class ApiSettingsPage {
       },
     });
 
-    // 测试连接按钮
-    const testButton = this.createButton("🔍 测试连接", "#2196f3");
-    testButton.addEventListener("click", () => this.testApiConnection());
-    buttonGroup.appendChild(testButton);
-
     // 保存按钮
     const saveButton = this.createButton("💾 保存设置", "#4caf50");
     saveButton.addEventListener("click", () => this.saveSettings());
@@ -1003,107 +1043,6 @@ export class ApiSettingsPage {
 
     form.appendChild(buttonGroup);
 
-    // 测试结果展示区域（防止进度窗文本过长被截断）
-    const resultBox = this.createElement("div", {
-      id: "api-test-result",
-      styles: {
-        display: "none",
-        marginTop: "12px",
-        padding: "12px 14px",
-        borderRadius: "6px",
-        backgroundColor: "#fff8e1",
-        border: "1px solid #ffe082",
-      },
-    });
-    // 标题 + 复制按钮
-    const resultTitle = this.createElement("div", {
-      styles: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: "8px",
-        marginBottom: "6px",
-      },
-    });
-    const resultTitleText = this.createElement("span", {
-      textContent: "API 连接测试结果",
-      styles: { fontSize: "13px", fontWeight: "600" },
-    });
-    // 按钮容器
-    const buttonContainer = this.createElement("div", {
-      styles: { display: "flex", gap: "8px" },
-    });
-    const copyBtn = this.createElement("button", {
-      textContent: "复制详情",
-      styles: {
-        border: "1px solid #ddd",
-        background: "#fff",
-        color: "#333",
-        borderRadius: "4px",
-        padding: "4px 8px",
-        cursor: "pointer",
-        fontSize: "12px",
-      },
-    });
-    copyBtn.addEventListener("click", async () => {
-      const text = (resultPre.textContent || "").toString();
-      const win = Zotero.getMainWindow() as any;
-      const doc = win?.document as Document | undefined;
-      const nav = (win as any)?.navigator as any;
-      try {
-        if (nav?.clipboard?.writeText) {
-          await nav.clipboard.writeText(text);
-        } else {
-          throw new Error("clipboard api unavailable");
-        }
-        new ztoolkit.ProgressWindow("API 连接测试", { closeTime: 1500 })
-          .createLine({ text: "已复制错误详情", type: "success" })
-          .show();
-      } catch {
-        try {
-          if (!doc) throw new Error("no document");
-          const tmp = doc.createElement("textarea");
-          tmp.value = text;
-          (tmp.style as any).position = "fixed";
-          (tmp.style as any).left = "-9999px";
-          (doc.documentElement || doc.body || doc).appendChild(tmp);
-          (tmp as any).select?.();
-          (doc as any).execCommand?.("copy");
-          (tmp as any).remove?.();
-          new ztoolkit.ProgressWindow("API 连接测试", { closeTime: 1500 })
-            .createLine({ text: "已复制错误详情", type: "success" })
-            .show();
-        } catch {
-          new ztoolkit.ProgressWindow("API 连接测试", { closeTime: 2500 })
-            .createLine({
-              text: "复制失败，可手动选择文本复制",
-              type: "default",
-            })
-            .show();
-        }
-      }
-    });
-    buttonContainer.appendChild(copyBtn);
-    resultTitle.appendChild(resultTitleText);
-    resultTitle.appendChild(buttonContainer);
-    const resultPre = this.createElement("pre", {
-      id: "api-test-result-text",
-      styles: {
-        margin: "0",
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-all",
-        maxHeight: "240px",
-        overflow: "auto",
-        fontFamily:
-          'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-        fontSize: "12px",
-        lineHeight: "1.5",
-        color: "#5d4037",
-      },
-    });
-    resultBox.appendChild(resultTitle);
-    resultBox.appendChild(resultPre);
-    form.appendChild(resultBox);
     this.container.appendChild(form);
   }
 
@@ -1149,8 +1088,9 @@ export class ApiSettingsPage {
   private createFormGroup(
     label: string,
     input: HTMLElement,
-    description?: string,
+    description?: string | HTMLElement,
     providerId?: ProviderId,
+    labelAction?: HTMLElement,
   ): HTMLElement {
     const group = this.createElement("div", {
       styles: {
@@ -1165,6 +1105,7 @@ export class ApiSettingsPage {
         alignItems: "center",
         gap: "10px",
         marginBottom: "8px",
+        width: "100%",
       },
     });
 
@@ -1195,19 +1136,30 @@ export class ApiSettingsPage {
       labelRow.appendChild(badge);
     }
 
+    if (labelAction) {
+      Object.assign(labelAction.style, {
+        marginLeft: "auto",
+      });
+      labelRow.appendChild(labelAction);
+    }
+
     group.appendChild(labelRow);
     group.appendChild(input);
 
     if (description) {
-      const desc = this.createElement("div", {
-        textContent: description,
-        styles: {
-          marginTop: "6px",
-          fontSize: "12px",
-          color: "#666",
-        },
-      });
-      group.appendChild(desc);
+      if (typeof description === "string") {
+        const desc = this.createElement("div", {
+          textContent: description,
+          styles: {
+            marginTop: "6px",
+            fontSize: "12px",
+            color: "#666",
+          },
+        });
+        group.appendChild(desc);
+      } else {
+        group.appendChild(description);
+      }
     }
 
     return group;
@@ -1249,6 +1201,605 @@ export class ApiSettingsPage {
     });
 
     return input;
+  }
+
+  private createEndpointFormGroup(
+    label: string,
+    id: string,
+    value: string,
+    placeholder: string,
+    options: {
+      officialEndpoint: string;
+      previewKind:
+        | "openaiResponses"
+        | "chatCompletions"
+        | "geminiStream"
+        | "anthropicMessages"
+        | "volcanoResponses"
+        | "ollamaChat";
+      modelInputId?: string;
+    },
+  ): HTMLElement {
+    const input = this.createInput(id, "text", value, placeholder);
+    const official = this.createEndpointMeta(
+      `官方 Endpoint：${options.officialEndpoint}`,
+    );
+    const preview = this.createEndpointMeta("预览：");
+    preview.style.maxWidth = "440px";
+
+    const desc = this.createElement("div", {
+      styles: {
+        marginTop: "6px",
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        fontSize: "12px",
+        color: "#666",
+      },
+    });
+    desc.appendChild(
+      this.createElement("span", {
+        textContent: "【必填】",
+        styles: {
+          flex: "0 0 auto",
+        },
+      }),
+    );
+    desc.appendChild(preview);
+
+    const update = () => {
+      const endpoint = this.buildEndpointPreview(
+        options.previewKind,
+        id,
+        placeholder,
+        options.modelInputId,
+      );
+      preview.textContent = `预览：${endpoint}`;
+      preview.title = endpoint;
+    };
+
+    input.addEventListener("input", update);
+    input.addEventListener("change", update);
+    this.endpointPreviewUpdaters.push(update);
+
+    setTimeout(() => {
+      if (options.modelInputId) {
+        const modelInput = this.container.querySelector(
+          `#setting-${options.modelInputId}`,
+        ) as HTMLInputElement | null;
+        modelInput?.addEventListener("input", update);
+        modelInput?.addEventListener("change", update);
+      }
+      update();
+    }, 0);
+
+    return this.createFormGroup(label, input, desc, undefined, official);
+  }
+
+  private createEndpointMeta(text: string): HTMLElement {
+    const el = this.createElement("span", {
+      textContent: text,
+      styles: {
+        display: "block",
+        minWidth: "0",
+        maxWidth: "520px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        fontSize: "12px",
+        color: "#666",
+      },
+    });
+    el.title = text.replace(/^官方 Endpoint：|^预览：/, "");
+    return el;
+  }
+
+  private refreshEndpointPreviews(): void {
+    setTimeout(() => {
+      this.endpointPreviewUpdaters.forEach((update) => update());
+    }, 0);
+  }
+
+  private buildEndpointPreview(
+    kind:
+      | "openaiResponses"
+      | "chatCompletions"
+      | "geminiStream"
+      | "anthropicMessages"
+      | "volcanoResponses"
+      | "ollamaChat",
+    urlInputId: string,
+    fallbackUrl: string,
+    modelInputId?: string,
+  ): string {
+    const input = this.container.querySelector(
+      `#setting-${urlInputId}`,
+    ) as HTMLInputElement | null;
+    const rawUrl = (input?.value || fallbackUrl || "").trim();
+    const modelInput = modelInputId
+      ? (this.container.querySelector(
+          `#setting-${modelInputId}`,
+        ) as HTMLInputElement | null)
+      : null;
+    const model = (modelInput?.value || modelInput?.placeholder || "{模型}")
+      .trim()
+      .replace(/^models\//, "");
+
+    if (kind === "openaiResponses") {
+      return this.toResponsesEndpoint(rawUrl, "/v1");
+    }
+    if (kind === "chatCompletions") {
+      return this.toChatCompletionsEndpoint(rawUrl);
+    }
+    if (kind === "geminiStream") {
+      const base = rawUrl
+        .replace(/\/+$/, "")
+        .replace(/\/v1beta(?:\/.*)?$/i, "");
+      return `${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+    }
+    if (kind === "anthropicMessages") {
+      const base = rawUrl.replace(/\/+$/, "").replace(/\/v1(?:\/.*)?$/i, "");
+      return `${base}/v1/messages`;
+    }
+    if (kind === "ollamaChat") {
+      return this.toOllamaChatEndpoint(rawUrl);
+    }
+    return this.toResponsesEndpoint(rawUrl, "");
+  }
+
+  private toResponsesEndpoint(url: string, defaultVersionPath: string): string {
+    const raw = url.trim().replace(/\/+$/, "");
+    if (!raw) return "";
+    if (/\/responses$/i.test(raw)) return raw;
+    if (/\/v\d+(?:beta)?$/i.test(raw)) return `${raw}/responses`;
+    if (/\/v\d+(?:beta)?\/.+$/i.test(raw)) {
+      return raw.replace(/(\/v\d+(?:beta)?)(?:\/.*)?$/i, "$1/responses");
+    }
+    return `${raw}${defaultVersionPath}/responses`;
+  }
+
+  private toChatCompletionsEndpoint(url: string): string {
+    const raw = url.trim().replace(/\/+$/, "");
+    if (!raw) return "";
+    if (/\/(?:v\d+(?:beta)?\/)?chat\/completions$/i.test(raw)) return raw;
+    if (/\/v\d+(?:beta)?$/i.test(raw)) return `${raw}/chat/completions`;
+    if (/\/v\d+(?:beta)?\/.+$/i.test(raw)) {
+      return raw.replace(/(\/v\d+(?:beta)?)(?:\/.*)?$/i, "$1/chat/completions");
+    }
+    return `${raw}/v1/chat/completions`;
+  }
+
+  private toOllamaChatEndpoint(url: string): string {
+    const raw = url.trim().replace(/\/+$/, "");
+    if (!raw) return "";
+    const base = raw
+      .replace(/\/v1(?:\/chat\/completions)?$/i, "")
+      .replace(/\/api(?:\/chat|\/generate|\/tags)?$/i, "")
+      .replace(/\/chat$/i, "")
+      .replace(/\/generate$/i, "");
+    return `${base}/api/chat`;
+  }
+
+  private createModelFormGroup(
+    label: string,
+    providerId: ProviderId,
+    modelInputId: string,
+    value: string,
+    placeholder: string,
+    description?: string,
+  ): HTMLElement {
+    const picker = this.createModelPicker(
+      providerId,
+      modelInputId,
+      value,
+      placeholder,
+    );
+    return this.createFormGroup(
+      label,
+      picker.body,
+      description,
+      undefined,
+      picker.action,
+    );
+  }
+
+  /**
+   * 创建模型输入控件：保留手动输入，获取列表后在输入框内显示下拉触发器。
+   */
+  private createModelPicker(
+    providerId: ProviderId,
+    modelInputId: string,
+    value: string,
+    placeholder?: string,
+  ): { body: HTMLElement; action: HTMLElement } {
+    const doc = Zotero.getMainWindow().document;
+    const wrapper = this.createElement("div", {
+      styles: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "6px",
+      },
+    });
+
+    const inputShell = this.createElement("div", {
+      styles: {
+        position: "relative",
+        width: "100%",
+        display: "flex",
+        alignItems: "stretch",
+      },
+    });
+
+    const input = this.createInput(modelInputId, "text", value, placeholder);
+    Object.assign(input.style, {
+      flex: "1 1 auto",
+      minWidth: "0",
+      borderRight: "0",
+      borderRadius: "4px 0 0 4px",
+    });
+
+    const toggleButton = this.createElement("button", {
+      textContent: "▼",
+      styles: {
+        flex: "0 0 38px",
+        width: "38px",
+        border: "1px solid #ddd",
+        borderRadius: "0 4px 4px 0",
+        backgroundColor: "#f8f9fa",
+        color: "#666",
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: "11px",
+        lineHeight: "1",
+      },
+    }) as HTMLButtonElement;
+    toggleButton.title = "选择模型；如未获取列表，将自动获取";
+
+    const dropdown = this.createElement("div", {
+      id: `setting-${modelInputId}-modelDropdown`,
+      styles: {
+        position: "absolute",
+        top: "100%",
+        left: "0",
+        right: "0",
+        marginTop: "4px",
+        maxHeight: "260px",
+        overflowY: "auto",
+        backgroundColor: "#fff",
+        border: "1px solid #ddd",
+        borderRadius: "4px",
+        boxShadow: "0 8px 20px rgba(0,0,0,0.14)",
+        zIndex: "1500",
+        display: "none",
+      },
+    });
+
+    const status = this.createElement("div", {
+      styles: {
+        display: "none",
+        fontSize: "12px",
+        lineHeight: "1.4",
+        whiteSpace: "nowrap",
+        maxWidth: "220px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+      },
+    });
+
+    const closeDropdown = () => {
+      dropdown.style.display = "none";
+      toggleButton.textContent = "▼";
+    };
+
+    const openDropdown = () => {
+      dropdown.style.display = "block";
+      toggleButton.textContent = "▲";
+    };
+
+    toggleButton.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (dropdown.style.display === "block") {
+        closeDropdown();
+        return;
+      }
+
+      if (dropdown.getAttribute("data-loaded") !== "true") {
+        const ok = await this.fetchAndRenderModelList(
+          providerId,
+          modelInputId,
+          input,
+          dropdown,
+          toggleButton,
+          status,
+          fetchButton,
+          true,
+        );
+        if (!ok) return;
+      }
+
+      openDropdown();
+    });
+
+    inputShell.addEventListener("click", (event) => {
+      event.stopPropagation();
+    });
+    doc.addEventListener("click", closeDropdown);
+    wrapper.addEventListener(
+      "DOMNodeRemoved",
+      () => doc.removeEventListener("click", closeDropdown),
+      { once: true },
+    );
+
+    inputShell.appendChild(input);
+    inputShell.appendChild(toggleButton);
+    inputShell.appendChild(dropdown);
+    wrapper.appendChild(inputShell);
+
+    const fetchButton = createStyledButton(
+      "🔄 获取模型列表",
+      "#59c0bc",
+      "small",
+    );
+    fetchButton.title = "使用当前填写的 endpoint 和密钥获取模型列表";
+    Object.assign(fetchButton.style, {
+      minHeight: "30px",
+      padding: "6px 12px",
+      fontSize: "12px",
+    });
+    fetchButton.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      await this.fetchAndRenderModelList(
+        providerId,
+        modelInputId,
+        input,
+        dropdown,
+        toggleButton,
+        status,
+        fetchButton,
+        false,
+      );
+    });
+
+    const actionGroup = this.createElement("div", {
+      styles: {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        marginLeft: "auto",
+        minWidth: "0",
+      },
+    });
+    actionGroup.appendChild(status);
+    actionGroup.appendChild(fetchButton);
+
+    return { body: wrapper, action: actionGroup };
+  }
+
+  private async fetchAndRenderModelList(
+    providerId: ProviderId,
+    modelInputId: string,
+    input: HTMLInputElement,
+    dropdown: HTMLElement,
+    toggleButton: HTMLButtonElement,
+    status: HTMLElement,
+    button: HTMLButtonElement,
+    openAfterSuccess = false,
+  ): Promise<boolean> {
+    const previousText = button.textContent || "🔄 获取模型列表";
+    button.disabled = true;
+    toggleButton.disabled = true;
+    button.textContent = "🔄 获取中...";
+    button.style.opacity = "0.75";
+    button.style.cursor = "wait";
+    toggleButton.style.opacity = "0.75";
+    toggleButton.style.cursor = "wait";
+    status.style.display = "block";
+    status.style.color = "#666";
+    status.textContent = "正在从供应商获取模型列表...";
+
+    try {
+      const options = this.getModelListOptions(providerId);
+      if (!options.apiUrl?.trim()) throw new Error("请先填写 API 地址");
+      if (
+        !LLMEndpointManager.providerAllowsEmptyApiKey(providerId) &&
+        !options.apiKey?.trim()
+      ) {
+        throw new Error("请先填写 API 密钥");
+      }
+
+      const models = await LLMClient.listModels(providerId, options);
+      if (models.length === 0) {
+        throw new Error("供应商未返回可用模型");
+      }
+
+      this.renderFetchedModelDropdown(modelInputId, input, dropdown, models);
+      dropdown.setAttribute("data-loaded", "true");
+      dropdown.style.display = openAfterSuccess ? "block" : "none";
+      toggleButton.textContent = openAfterSuccess ? "▲" : "▼";
+      status.style.color = "#2e7d32";
+      status.textContent = `已获取 ${models.length} 个模型`;
+
+      new ztoolkit.ProgressWindow("模型列表", {
+        closeTime: 1800,
+      })
+        .createLine({
+          text: `✅ 已获取 ${models.length} 个模型`,
+          type: "success",
+        })
+        .show();
+      return true;
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      dropdown.setAttribute("data-loaded", "false");
+      dropdown.style.display = "none";
+      toggleButton.textContent = "▼";
+      status.style.display = "block";
+      status.style.color = "#b71c1c";
+      status.textContent = `获取失败：${message}`;
+
+      new ztoolkit.ProgressWindow("模型列表", {
+        closeTime: 3500,
+      })
+        .createLine({ text: `❌ ${message}`, type: "fail" })
+        .show();
+      return false;
+    } finally {
+      button.disabled = false;
+      toggleButton.disabled = false;
+      button.textContent = previousText;
+      button.style.opacity = "1";
+      button.style.cursor = "pointer";
+      toggleButton.style.opacity = "1";
+      toggleButton.style.cursor = "pointer";
+    }
+  }
+
+  private renderFetchedModelDropdown(
+    modelInputId: string,
+    input: HTMLInputElement,
+    dropdown: HTMLElement,
+    models: LLMModelInfo[],
+  ): void {
+    dropdown.innerHTML = "";
+
+    models.forEach((model) => {
+      const label = this.formatModelOptionLabel(model);
+      const item = this.createElement("div", {
+        textContent: label,
+        styles: {
+          padding: "9px 12px",
+          cursor: "pointer",
+          fontSize: "13px",
+          color: "#333",
+          backgroundColor: input.value.trim() === model.id ? "#e8f5f4" : "#fff",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+        },
+      });
+      item.title = label;
+      item.setAttribute("data-model-id", model.id);
+
+      item.addEventListener("mouseenter", () => {
+        item.style.backgroundColor = "#f0f7f7";
+      });
+      item.addEventListener("mouseleave", () => {
+        item.style.backgroundColor =
+          input.value.trim() === model.id ? "#e8f5f4" : "#fff";
+      });
+      item.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.applyModelSelection(modelInputId, input, model.id);
+        dropdown.querySelectorAll("[data-model-id]").forEach((el: Element) => {
+          const row = el as HTMLElement;
+          row.style.backgroundColor =
+            row.getAttribute("data-model-id") === model.id ? "#e8f5f4" : "#fff";
+        });
+        dropdown.style.display = "none";
+        const toggleButton = dropdown.parentElement?.querySelector(
+          "button",
+        ) as HTMLButtonElement | null;
+        if (toggleButton) toggleButton.textContent = "▼";
+      });
+
+      dropdown.appendChild(item);
+    });
+  }
+
+  private applyModelSelection(
+    modelInputId: string,
+    input: HTMLInputElement,
+    modelId: string,
+  ): void {
+    input.value = modelId;
+    setPref(modelInputId as any, modelId);
+
+    try {
+      const win = Zotero.getMainWindow();
+      input.dispatchEvent(new win.Event("input", { bubbles: true }));
+      input.dispatchEvent(new win.Event("change", { bubbles: true }));
+    } catch {
+      // best effort: the value and pref have already been updated
+    }
+  }
+
+  private formatModelOptionLabel(model: LLMModelInfo): string {
+    const parts = [model.id];
+    if (model.name && model.name !== model.id) parts.push(model.name);
+    if (model.contextLength) {
+      parts.push(`${model.contextLength.toLocaleString()} ctx`);
+    }
+    return parts.join(" · ");
+  }
+
+  private getModelListOptions(providerId: ProviderId): Partial<LLMOptions> {
+    const readInput = (id: string) =>
+      (
+        this.container.querySelector(
+          `#setting-${id}`,
+        ) as HTMLInputElement | null
+      )?.value?.trim() || "";
+
+    const timeout = Math.max(
+      parseInt(readInput("requestTimeout") || "30000", 10) || 30000,
+      30000,
+    );
+    const keyManagerId = this.mapToKeyManagerId(providerId);
+
+    const configs: Record<
+      ProviderId,
+      { apiUrlId: string; apiKeyId: string; modelId: string }
+    > = {
+      openai: {
+        apiUrlId: "openaiApiUrl",
+        apiKeyId: "openaiApiKey",
+        modelId: "openaiApiModel",
+      },
+      "openai-compat": {
+        apiUrlId: "openaiCompatApiUrl",
+        apiKeyId: "openaiCompatApiKey",
+        modelId: "openaiCompatModel",
+      },
+      google: {
+        apiUrlId: "geminiApiUrl",
+        apiKeyId: "geminiApiKey",
+        modelId: "geminiModel",
+      },
+      anthropic: {
+        apiUrlId: "anthropicApiUrl",
+        apiKeyId: "anthropicApiKey",
+        modelId: "anthropicModel",
+      },
+      openrouter: {
+        apiUrlId: "openRouterApiUrl",
+        apiKeyId: "openRouterApiKey",
+        modelId: "openRouterModel",
+      },
+      volcanoark: {
+        apiUrlId: "volcanoArkApiUrl",
+        apiKeyId: "volcanoArkApiKey",
+        modelId: "volcanoArkModel",
+      },
+      ollama: {
+        apiUrlId: "ollamaApiUrl",
+        apiKeyId: "ollamaApiKey",
+        modelId: "ollamaModel",
+      },
+    };
+    const config = configs[keyManagerId];
+
+    return {
+      apiUrl: readInput(config.apiUrlId),
+      apiKey:
+        readInput(config.apiKeyId) || ApiKeyManager.getCurrentKey(keyManagerId),
+      model: readInput(config.modelId),
+      requestTimeoutMs: timeout,
+    };
   }
 
   /**
@@ -1348,6 +1899,7 @@ export class ApiSettingsPage {
         anthropic: "anthropicApiKey",
         openrouter: "openRouterApiKey",
         volcanoark: "volcanoArkApiKey",
+        ollama: "ollamaApiKey",
       };
       const prefKey = mapping[providerId];
       if (prefKey) {
@@ -1872,6 +2424,16 @@ export class ApiSettingsPage {
       const vaModelEl = this.container.querySelector(
         "#setting-volcanoArkModel",
       ) as HTMLInputElement;
+      // Ollama
+      const ollamaUrlEl = this.container.querySelector(
+        "#setting-ollamaApiUrl",
+      ) as HTMLInputElement;
+      const ollamaKeyEl = this.container.querySelector(
+        "#setting-ollamaApiKey",
+      ) as HTMLInputElement;
+      const ollamaModelEl = this.container.querySelector(
+        "#setting-ollamaModel",
+      ) as HTMLInputElement;
       const temperatureEl = this.container.querySelector(
         "#setting-temperature",
       ) as HTMLInputElement;
@@ -1942,6 +2504,9 @@ export class ApiSettingsPage {
         volcanoArkApiUrl: vaUrlEl?.value?.trim() || "",
         volcanoArkApiKey: vaKeyEl?.value?.trim() || "",
         volcanoArkModel: vaModelEl?.value?.trim() || "",
+        ollamaApiUrl: ollamaUrlEl?.value?.trim() || "",
+        ollamaApiKey: ollamaKeyEl?.value?.trim() || "",
+        ollamaModel: ollamaModelEl?.value?.trim() || "",
         temperature: temperatureEl?.value || "0.7",
         maxTokens: maxTokensEl?.value?.trim() || "4096",
         topP: topPEl?.value || "1.0",
@@ -1970,36 +2535,54 @@ export class ApiSettingsPage {
 
       // 验证必填项 - 详细提示哪些字段缺失
       const missingFields: string[] = [];
-      if (provider === "google") {
-        if (!values.geminiApiUrl) missingFields.push("API 基础地址(Gemini)");
-        if (!values.geminiApiKey) missingFields.push("API 密钥(Gemini)");
-        if (!values.geminiModel) missingFields.push("模型名称(Gemini)");
-      } else if (provider === "anthropic") {
-        if (!values.anthropicApiUrl)
-          missingFields.push("API 基础地址(Anthropic)");
-        if (!values.anthropicApiKey) missingFields.push("API 密钥(Anthropic)");
-        if (!values.anthropicModel) missingFields.push("模型名称(Anthropic)");
-      } else if (provider === "openrouter") {
-        if (!values.openRouterApiUrl)
-          missingFields.push("API 基础地址(OpenRouter)");
-        if (!values.openRouterApiKey)
-          missingFields.push("API 密钥(OpenRouter)");
-        if (!values.openRouterModel) missingFields.push("模型名称(OpenRouter)");
-      } else if (provider === "volcanoark") {
-        if (!values.volcanoArkApiUrl) missingFields.push("API 地址(火山方舟)");
-        if (!values.volcanoArkApiKey) missingFields.push("API 密钥(火山方舟)");
-        if (!values.volcanoArkModel) missingFields.push("模型名称(火山方舟)");
-      } else if (provider === "openai-compat") {
-        if (!values.openaiCompatApiUrl)
-          missingFields.push("兼容 API 地址(OpenAI兼容)");
-        if (!values.openaiCompatApiKey)
-          missingFields.push("兼容 API 密钥(OpenAI兼容)");
-        if (!values.openaiCompatModel)
-          missingFields.push("兼容 模型名称(OpenAI兼容)");
-      } else {
-        if (!values.openaiApiUrl) missingFields.push("API 地址");
-        if (!values.openaiApiKey) missingFields.push("API 密钥");
-        if (!values.openaiApiModel) missingFields.push("模型名称");
+      const hasUsableEndpoint = LLMEndpointManager.getEnabledEndpoints().some(
+        (endpoint) =>
+          endpoint.apiUrl.trim() &&
+          endpoint.model.trim() &&
+          (endpoint.apiKey.trim() ||
+            LLMEndpointManager.providerAllowsEmptyApiKey(
+              endpoint.providerType,
+            )),
+      );
+      if (!hasUsableEndpoint) {
+        if (provider === "google") {
+          if (!values.geminiApiUrl) missingFields.push("API 基础地址(Gemini)");
+          if (!values.geminiApiKey) missingFields.push("API 密钥(Gemini)");
+          if (!values.geminiModel) missingFields.push("模型名称(Gemini)");
+        } else if (provider === "anthropic") {
+          if (!values.anthropicApiUrl)
+            missingFields.push("API 基础地址(Anthropic)");
+          if (!values.anthropicApiKey)
+            missingFields.push("API 密钥(Anthropic)");
+          if (!values.anthropicModel) missingFields.push("模型名称(Anthropic)");
+        } else if (provider === "openrouter") {
+          if (!values.openRouterApiUrl)
+            missingFields.push("API 基础地址(OpenRouter)");
+          if (!values.openRouterApiKey)
+            missingFields.push("API 密钥(OpenRouter)");
+          if (!values.openRouterModel)
+            missingFields.push("模型名称(OpenRouter)");
+        } else if (provider === "volcanoark") {
+          if (!values.volcanoArkApiUrl)
+            missingFields.push("API 地址(火山方舟)");
+          if (!values.volcanoArkApiKey)
+            missingFields.push("API 密钥(火山方舟)");
+          if (!values.volcanoArkModel) missingFields.push("模型名称(火山方舟)");
+        } else if (provider === "ollama") {
+          if (!values.ollamaApiUrl) missingFields.push("API 地址(Ollama)");
+          if (!values.ollamaModel) missingFields.push("模型名称(Ollama)");
+        } else if (provider === "openai-compat") {
+          if (!values.openaiCompatApiUrl)
+            missingFields.push("兼容 API 地址(OpenAI兼容)");
+          if (!values.openaiCompatApiKey)
+            missingFields.push("兼容 API 密钥(OpenAI兼容)");
+          if (!values.openaiCompatModel)
+            missingFields.push("兼容 模型名称(OpenAI兼容)");
+        } else {
+          if (!values.openaiApiUrl) missingFields.push("API 地址");
+          if (!values.openaiApiKey) missingFields.push("API 密钥");
+          if (!values.openaiApiModel) missingFields.push("模型名称");
+        }
       }
 
       if (missingFields.length > 0) {
@@ -2036,6 +2619,9 @@ export class ApiSettingsPage {
       setPref("volcanoArkApiUrl", values.volcanoArkApiUrl);
       setPref("volcanoArkApiKey", values.volcanoArkApiKey);
       setPref("volcanoArkModel", values.volcanoArkModel);
+      setPref("ollamaApiUrl", values.ollamaApiUrl);
+      setPref("ollamaApiKey", values.ollamaApiKey);
+      setPref("ollamaModel", values.ollamaModel);
       setPref("temperature", values.temperature);
       setPref("maxTokens", values.maxTokens);
       setPref("topP", values.topP);
@@ -2090,6 +2676,16 @@ export class ApiSettingsPage {
           (pdfAttachmentModeEl as any).getValue() || "default",
         );
       }
+      const mineruModelVersionEl = this.container.querySelector(
+        "#setting-mineruModelVersion",
+      ) as HTMLElement | null;
+      if (mineruModelVersionEl && (mineruModelVersionEl as any).getValue) {
+        const mineruModelVersion = (mineruModelVersionEl as any).getValue();
+        setPref(
+          "mineruModelVersion",
+          mineruModelVersion === "pipeline" ? "pipeline" : "vlm",
+        );
+      }
 
       ztoolkit.log("[API Settings] Settings saved successfully");
 
@@ -2135,6 +2731,8 @@ export class ApiSettingsPage {
     if (provider === "anthropic") return "anthropic";
     if (provider === "openrouter") return "openrouter";
     if (provider === "openai-compat") return "openai-compat";
+    if (provider === "volcanoark") return "volcanoark";
+    if (provider === "ollama") return "ollama";
     return "openai";
   }
 
@@ -2481,9 +3079,18 @@ export class ApiSettingsPage {
     );
     setPref("volcanoArkApiKey", "");
     setPref("volcanoArkModel", "doubao-seed-1-8-251228");
+    setPref("ollamaApiUrl", "http://localhost:11434");
+    setPref("ollamaApiKey", "");
+    setPref("ollamaModel", "llama3.2");
+    setPref("llmEndpoints", "[]");
+    setPref("llmRoutingStrategy", "priority");
+    setPref("llmRoundRobinCursor", "");
+    setPref("multiModelSummaryEnabled", false);
+    setPref("multiModelSummaryEndpointIds", "[]");
     setPref("temperature", "0.7");
     setPref("maxTokens", "8192");
     setPref("topP", "1.0");
+    setPref("reasoningEffort", "default");
     setPref("enableTemperature", true as any);
     setPref("enableMaxTokens", true as any);
     setPref("enableTopP", true as any);

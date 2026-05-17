@@ -18,10 +18,12 @@
 
 import { PDFExtractor } from "./pdfExtractor";
 import { NoteGenerator } from "./noteGenerator";
-import LLMClient from "./llmClient";
+import LLMService from "./llmService";
+import {
+  LLMNoteMetadataService,
+  type LLMNoteMetadata,
+} from "./llmNoteMetadata";
 import { getPref } from "../utils/prefs";
-import { ProviderRegistry } from "./llmproviders/ProviderRegistry";
-import { PdfFileInfo } from "./llmproviders/ILlmProvider";
 import { marked } from "marked";
 import {
   DEFAULT_TABLE_TEMPLATE,
@@ -54,6 +56,8 @@ interface TargetedAnswerOptions {
  * 文献综述服务类
  */
 export class LiteratureReviewService {
+  private static lastTableMetadataByItemId = new Map<number, LLMNoteMetadata>();
+
   /**
    * 生成文献综述（表格驱动的两阶段流程）
    *
@@ -131,11 +135,12 @@ export class LiteratureReviewService {
       DEFAULT_TABLE_REVIEW_PROMPT;
     const fullPrompt = `${reviewPrompt}\n\n以下是各文献的结构化信息表格：\n\n${aggregated}`;
 
-    let summaryContent = await LLMClient.generateSummaryWithRetry(
-      aggregated,
-      false,
-      fullPrompt,
-    );
+    const reviewResponse = await LLMService.generate({
+      task: "literature-review",
+      prompt: fullPrompt,
+      content: { kind: "text", text: aggregated, policy: "text" },
+    });
+    let summaryContent = reviewResponse.text;
 
     // 3. 后处理引用链接
     summaryContent = await this.postProcessCitations(
@@ -150,6 +155,7 @@ export class LiteratureReviewService {
       collection,
       reviewName,
       summaryContent,
+      LLMNoteMetadataService.fromResponse("literature-review", reviewResponse),
     );
 
     // 5. 为所有已纳入综述的文献添加 AI-Reviewed 标签
@@ -271,11 +277,12 @@ export class LiteratureReviewService {
     const fullPrompt = `${questionPrompt}${selectedEntriesInstruction}\n\n以下是各文献的结构化信息表格：\n\n${aggregated}`;
 
     progressCallback?.("正在回答问题...", 75);
-    let answerContent = await LLMClient.generateSummaryWithRetry(
-      aggregated,
-      false,
-      fullPrompt,
-    );
+    const answerResponse = await LLMService.generate({
+      task: "literature-review",
+      prompt: fullPrompt,
+      content: { kind: "text", text: aggregated, policy: "text" },
+    });
+    let answerContent = answerResponse.text;
     answerContent = await this.postProcessCitations(
       answerContent,
       itemPdfPairs,
@@ -286,6 +293,7 @@ export class LiteratureReviewService {
       collection,
       noteTitle,
       answerContent,
+      LLMNoteMetadataService.fromResponse("literature-review", answerResponse),
     );
     progressCallback?.("完成!", 100);
     return note;
@@ -581,25 +589,6 @@ ${entryList}
 
     progressCallback?.(`正在提取 PDF: ${itemTitle.slice(0, 30)}...`, 10);
 
-    // 提取 PDF 内容
-    const filePath = await pdfAttachment.getFilePathAsync();
-    if (!filePath) {
-      throw new Error(`PDF 附件无文件路径: ${pdfAttachment.id}`);
-    }
-
-    let pdfContent: string;
-    let isBase64 = false;
-
-    try {
-      const fileData = await IOUtils.read(filePath);
-      pdfContent = this.arrayBufferToBase64(fileData);
-      isBase64 = true;
-    } catch (e) {
-      // 回退到文本模式
-      pdfContent = await PDFExtractor.extractTextFromItem(item);
-      isBase64 = false;
-    }
-
     // 构建完整提示词：将 ${tableTemplate} 替换为实际模板
     const actualPrompt = fillPrompt.replace(
       /\$\{tableTemplate\}/g,
@@ -608,16 +597,54 @@ ${entryList}
 
     progressCallback?.(`正在填表: ${itemTitle.slice(0, 30)}...`, 50);
 
-    // 调用 LLM 填表
-    const result = await LLMClient.generateSummaryWithRetry(
-      pdfContent,
-      isBase64,
-      actualPrompt,
+    // 调用统一 LLM 中间件填表。输入策略由中间件统一读取并按 Provider 能力降级。
+    const response = await LLMService.generate({
+      task: "table",
+      prompt: actualPrompt,
+      content: {
+        kind: "pdf-attachment",
+        item,
+        attachment: pdfAttachment,
+      },
+      onProgress: () => {
+        /* dummy callback to trigger streaming */
+      },
+    });
+    const result = response.text;
+    this.lastTableMetadataByItemId.set(
+      item.id,
+      LLMNoteMetadataService.fromResponse("table", response),
     );
 
     progressCallback?.(`填表完成: ${itemTitle.slice(0, 30)}`, 100);
 
     return result;
+  }
+
+  /**
+   * 查找文献条目下已有的 AI-Table 填表笔记条目
+   *
+   * @param item 文献条目
+   * @returns 填表笔记条目，未找到返回 null
+   */
+  static async findTableNoteItem(
+    item: Zotero.Item,
+  ): Promise<Zotero.Item | null> {
+    try {
+      const noteIDs = (item as any).getNotes?.() || [];
+      for (const nid of noteIDs) {
+        const note = await Zotero.Items.getAsync(nid);
+        if (!note) continue;
+        const tags: Array<{ tag: string }> = (note as any).getTags?.() || [];
+        const hasTableTag = tags.some((t) => t.tag === TABLE_NOTE_TAG);
+        if (hasTableTag) {
+          return note as Zotero.Item;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -628,34 +655,28 @@ ${entryList}
    */
   static async findTableNote(item: Zotero.Item): Promise<string | null> {
     try {
-      const noteIDs = (item as any).getNotes?.() || [];
-      for (const nid of noteIDs) {
-        const note = await Zotero.Items.getAsync(nid);
-        if (!note) continue;
-        const tags: Array<{ tag: string }> = (note as any).getTags?.() || [];
-        const hasTableTag = tags.some((t) => t.tag === TABLE_NOTE_TAG);
-        if (hasTableTag) {
-          const noteContent: string = (note as any).getNote?.() || "";
-          // 提取 data-ai-table-raw 元素中的原始 Markdown（兼容 div 和 pre）
-          const rawMatch = noteContent.match(
-            /<(?:div|pre)[^>]*data-ai-table-raw[^>]*>([\s\S]*?)<\/(?:div|pre)>/,
-          );
-          if (rawMatch && rawMatch[1]) {
-            // 反转义 HTML 实体
-            const raw = rawMatch[1]
-              .replace(/&amp;/g, "&")
-              .replace(/&lt;/g, "<")
-              .replace(/&gt;/g, ">")
-              .replace(/&quot;/g, '"')
-              .trim();
-            return raw || null;
-          }
-          // 兼容旧格式：直接去除 HTML 标签
-          const textContent = noteContent.replace(/<[^>]*>/g, "").trim();
-          return textContent || null;
-        }
+      const note = await this.findTableNoteItem(item);
+      if (!note) return null;
+
+      const noteContent: string = (note as any).getNote?.() || "";
+      // 提取 data-ai-table-raw 元素中的原始 Markdown（兼容 div 和 pre）
+      const rawMatch = noteContent.match(
+        /<(?:div|pre)[^>]*data-ai-table-raw[^>]*>([\s\S]*?)<\/(?:div|pre)>/,
+      );
+      if (rawMatch && rawMatch[1]) {
+        // 反转义 HTML 实体
+        const raw = rawMatch[1]
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"')
+          .trim();
+        return raw || null;
       }
-      return null;
+
+      // 兼容旧格式：直接去除 HTML 标签
+      const textContent = noteContent.replace(/<[^>]*>/g, "").trim();
+      return textContent || null;
     } catch {
       return null;
     }
@@ -677,23 +698,14 @@ ${entryList}
     item: Zotero.Item,
     tableContent: string,
     forceOverwrite: boolean = false,
+    metadata?: LLMNoteMetadata | null,
   ): Promise<Zotero.Item> {
     const strategy: TableStrategy = ((getPref(
       "tableStrategy" as any,
     ) as string) || "skip") as TableStrategy;
 
     // 查找已有的 AI-Table 笔记
-    const noteIDs = (item as any).getNotes?.() || [];
-    let existingNote: Zotero.Item | null = null;
-    for (const nid of noteIDs) {
-      const note = await Zotero.Items.getAsync(nid);
-      if (!note) continue;
-      const tags: Array<{ tag: string }> = (note as any).getTags?.() || [];
-      if (tags.some((t) => t.tag === TABLE_NOTE_TAG)) {
-        existingNote = note;
-        break;
-      }
-    }
+    const existingNote = await this.findTableNoteItem(item);
 
     // 根据策略处理已有笔记
     if (existingNote) {
@@ -731,15 +743,22 @@ ${entryList}
       (_match, formula) => `<span class="math">$${formula.trim()}$</span>`,
     );
 
-    // 将原始 Markdown 存储在隐藏元素中，供 findTableNote 提取
+    // 将原始 Markdown 存储在预格式区块中，供 findTableNote 提取
     const escapedRaw = tableContent
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
-    const noteHtml =
+    const metadataBlock =
+      metadata || this.lastTableMetadataByItemId.get(item.id) || null;
+    const noteHtmlRaw =
       `<h2>📊 文献表格 - ${itemTitle}</h2>` +
       `<div>${renderedHtml}</div>` +
-      `<div style="display:none" data-ai-table-raw>${escapedRaw}</div>`;
+      `<br/>` +
+      `<p style="color: gray; font-size: 12px;"><em>👇 以下为系统缓存的原始 Markdown 数据（用于追加填表，请勿修改）：</em></p>` +
+      `<pre data-ai-table-raw>${escapedRaw}</pre>`;
+    const noteHtml = metadataBlock
+      ? LLMNoteMetadataService.wrapHtml(noteHtmlRaw, metadataBlock)
+      : noteHtmlRaw;
 
     const note = new Zotero.Item("note");
     note.libraryID = item.libraryID;
@@ -1162,34 +1181,23 @@ ${entryList}
       throw new Error("没有可用的 PDF 内容");
     }
 
-    // 检查当前使用的 API 提供商
-    const providerName = (getPref("provider") as string) || "google";
-    const provider = ProviderRegistry.get(providerName);
+    progressCallback?.("正在调用 AI 生成综述...", 60);
 
-    // 检查 provider 是否支持多文件处理
-    const supportsMultiFile =
-      provider && typeof provider.generateMultiFileSummary === "function";
+    const files = pdfContents.map((pdf, index) => ({
+      filePath: pdf.filePath,
+      displayName: `${index + 1}_${pdf.title.slice(0, 50)}`,
+      base64Content: pdf.isBase64 ? pdf.content : undefined,
+      textContent: pdf.isBase64 ? undefined : pdf.content,
+    }));
 
-    // 判断是否是 Gemini 提供商（支持 google 和 gemini 两种名称）
-    const isGemini =
-      providerName === "google" ||
-      providerName.toLowerCase().includes("gemini");
-
-    if (supportsMultiFile && isGemini) {
-      // 使用 Gemini 多文件模式 (inline_data)
-      return await this.generateWithGeminiFileAPI(
-        pdfContents,
-        prompt,
-        progressCallback,
-      );
-    } else {
-      // 回退到合并文本模式
-      return await this.generateWithMergedText(
-        pdfContents,
-        prompt,
-        progressCallback,
-      );
-    }
+    return LLMService.generateText({
+      task: "literature-review",
+      prompt,
+      content: {
+        kind: "pdf-files",
+        files,
+      },
+    });
   }
 
   /**
@@ -1200,35 +1208,22 @@ ${entryList}
     prompt: string,
     progressCallback?: (message: string, progress: number) => void,
   ): Promise<string> {
-    progressCallback?.("正在上传 PDF 文件到 Gemini...", 55);
+    progressCallback?.("正在上传 PDF 文件到大模型...", 55);
 
-    // 获取 Gemini provider（支持 google 和 gemini 两种名称）
-    let provider = ProviderRegistry.get("google");
-    if (!provider) {
-      provider = ProviderRegistry.get("gemini");
-    }
-    if (!provider || typeof provider.generateMultiFileSummary !== "function") {
-      throw new Error("Gemini provider 不支持多文件处理");
-    }
-
-    // 构建 PDF 文件信息列表
-    const pdfFiles: PdfFileInfo[] = pdfContents.map((pdf, index) => ({
+    const files = pdfContents.map((pdf, index) => ({
       filePath: pdf.filePath,
       displayName: `${index + 1}_${pdf.title.slice(0, 50)}`,
-      base64Content: pdf.content,
+      base64Content: pdf.isBase64 ? pdf.content : undefined,
+      textContent: pdf.isBase64 ? undefined : pdf.content,
     }));
-
-    // 获取 LLM 选项
-    const options = LLMClient.getLLMOptions();
 
     progressCallback?.("正在调用 AI 生成综述...", 65);
 
-    // 调用 Gemini 多文件处理
-    const result = await provider.generateMultiFileSummary(
-      pdfFiles,
+    const result = await LLMService.generateText({
+      task: "literature-review",
       prompt,
-      options,
-    );
+      content: { kind: "pdf-files", files },
+    });
 
     return result;
   }
@@ -1264,11 +1259,16 @@ ${entryList}
     if (hasBase64 && firstBase64Content) {
       const fullPrompt = `${prompt}\n\n以下是需要综述的论文列表:\n${pdfContents.map((p, i) => `${i + 1}. ${p.title}`).join("\n")}\n\n请基于上传的 PDF 内容生成综述。`;
 
-      const result = await LLMClient.generateSummaryWithRetry(
-        firstBase64Content,
-        true,
-        fullPrompt,
-      );
+      const result = await LLMService.generateText({
+        task: "literature-review",
+        prompt: fullPrompt,
+        content: {
+          kind: "legacy",
+          content: firstBase64Content,
+          isBase64: true,
+          policy: "pdf-base64",
+        },
+      });
       return result;
     }
 
@@ -1279,11 +1279,11 @@ ${entryList}
 
     const fullPrompt = `${prompt}\n\n以下是需要综述的论文内容:\n${combinedContent}`;
 
-    const result = await LLMClient.generateSummaryWithRetry(
-      combinedContent,
-      false,
-      fullPrompt,
-    );
+    const result = await LLMService.generateText({
+      task: "literature-review",
+      prompt: fullPrompt,
+      content: { kind: "text", text: combinedContent, policy: "text" },
+    });
 
     return result;
   }
@@ -1295,10 +1295,13 @@ ${entryList}
     reportItem: Zotero.Item,
     reviewName: string,
     content: string,
+    metadata?: LLMNoteMetadata | null,
   ): Promise<Zotero.Item> {
     const formattedContent = NoteGenerator.formatNoteContent(
       reviewName,
       content,
+      "",
+      metadata,
     );
     const note = await NoteGenerator.createNote(reportItem, formattedContent);
     return note;
@@ -1316,11 +1319,14 @@ ${entryList}
     collection: Zotero.Collection,
     reviewName: string,
     content: string,
+    metadata?: LLMNoteMetadata | null,
   ): Promise<Zotero.Item> {
     // 格式化内容
     const formattedContent = NoteGenerator.formatNoteContent(
       reviewName,
       content,
+      "",
+      metadata,
     );
 
     // 创建独立笔记（无父条目）

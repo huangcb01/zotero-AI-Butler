@@ -1,7 +1,28 @@
 import { ILlmProvider, PdfFileInfo } from "./ILlmProvider";
-import { ConversationMessage, LLMOptions, ProgressCb } from "./types";
+import {
+  ConversationMessage,
+  LLMOptions,
+  LLMModelInfo,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
+import {
+  getConnectionTestInput,
+  getConnectionTestModeLabel,
+} from "./shared/connectionTest";
+import {
+  deriveVersionedModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import {
+  bindAbortSignal,
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./shared/requestAbort";
 
 /**
  * 火山引擎 Ark Provider
@@ -10,6 +31,14 @@ import { getRequestTimeoutMs } from "./shared/llmutils";
  */
 export class VolcanoArkProvider implements ILlmProvider {
   readonly id = "volcanoark";
+  readonly capabilities: LLMProviderCapabilities = {
+    supportsText: true,
+    supportsStreaming: true,
+    supportsPdfBase64: true,
+    maxPdfFiles: 20,
+    supportsSystemPrompt: true,
+    supportedParams: ["temperature", "maxTokens", "stream"],
+  };
 
   async generateSummary(
     content: string,
@@ -28,6 +57,7 @@ export class VolcanoArkProvider implements ILlmProvider {
 
     if (!baseUrl) throw new Error("火山引擎 API URL 未配置");
     if (!apiKey) throw new Error("火山引擎 API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
     // 如果 baseUrl 已经以 /responses 结尾，直接使用；否则追加
     const endpoint = baseUrl.endsWith("/responses")
@@ -89,6 +119,8 @@ export class VolcanoArkProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -99,7 +131,15 @@ export class VolcanoArkProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -164,6 +204,9 @@ export class VolcanoArkProvider implements ILlmProvider {
         },
       });
     } catch (error: any) {
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
       let errorMessage = error?.message || "火山引擎请求失败";
       try {
         const responseText =
@@ -183,6 +226,8 @@ export class VolcanoArkProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");
@@ -206,6 +251,7 @@ export class VolcanoArkProvider implements ILlmProvider {
 
     if (!baseUrl) throw new Error("火山引擎 API URL 未配置");
     if (!apiKey) throw new Error("火山引擎 API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
     // 如果 baseUrl 已经以 /responses 结尾，直接使用；否则追加
     const endpoint = baseUrl.endsWith("/responses")
@@ -275,6 +321,7 @@ export class VolcanoArkProvider implements ILlmProvider {
     let partialLine = "";
     let abortError: Error | null = null;
     let gotAnyDelta = false;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -285,7 +332,15 @@ export class VolcanoArkProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -371,10 +426,16 @@ export class VolcanoArkProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) {
           return chunks.join("");
         }
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "火山引擎请求失败";
       try {
@@ -400,6 +461,8 @@ export class VolcanoArkProvider implements ILlmProvider {
       });
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     return chunks.join("");
@@ -418,12 +481,30 @@ export class VolcanoArkProvider implements ILlmProvider {
     const url = baseUrl.endsWith("/responses")
       ? baseUrl
       : `${baseUrl}/responses`;
+    const testInput = getConnectionTestInput(options);
+    const userContent = testInput.isBase64
+      ? [
+          {
+            type: "input_file",
+            file_data: `data:application/pdf;base64,${testInput.pdfBase64 || ""}`,
+            filename: "connection-test.pdf",
+          },
+          {
+            type: "input_text",
+            text: testInput.text,
+          },
+        ]
+      : testInput.text;
     const payload = {
       model,
       input: [
         {
+          role: "system",
+          content: SYSTEM_ROLE_PROMPT,
+        },
+        {
           role: "user",
-          content: "Hello! Please respond with 'OK' to confirm connection.",
+          content: userContent,
         },
       ],
       max_output_tokens: 16,
@@ -442,6 +523,7 @@ export class VolcanoArkProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: 30000,
+        errorDelayMax: 0,
       });
       // 提取响应首部
       try {
@@ -515,7 +597,7 @@ export class VolcanoArkProvider implements ILlmProvider {
         typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
       // 从 Response API 格式提取文本
       const text = this.extractVolcanoTextFromFull(json);
-      return `✅ 连接成功!\n模型: ${model}\n响应: ${text}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ 连接成功!\n模型: ${model}\n响应: ${text}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
     }
 
     // 非 200 但未抛出异常的情况
@@ -529,6 +611,27 @@ export class VolcanoArkProvider implements ILlmProvider {
       responseHeaders,
       responseBody: rawResponse,
     });
+  }
+
+  async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
+    const baseUrl = (
+      options.apiUrl || "https://ark.cn-beijing.volces.com/api/v3/responses"
+    ).replace(/\/+$/, "");
+    const apiKey = (options.apiKey || "").trim();
+    if (!baseUrl) throw new Error("火山引擎 API URL 未配置");
+    if (!apiKey) throw new Error("火山引擎 API Key 未配置");
+
+    const url = deriveVersionedModelsUrl(
+      baseUrl,
+      "https://ark.cn-beijing.volces.com/api/v3/responses",
+      "/api/v3",
+    );
+    const data = await requestModelListJson(
+      url,
+      { Authorization: `Bearer ${apiKey}` },
+      options.requestTimeoutMs ?? 30000,
+    );
+    return parseModelListResponse(data);
   }
 
   /**
@@ -651,6 +754,7 @@ export class VolcanoArkProvider implements ILlmProvider {
     if (!baseUrl) throw new Error("火山引擎 API URL 未配置");
     if (!apiKey) throw new Error("火山引擎 API Key 未配置");
     if (pdfFiles.length === 0) throw new Error("没有要处理的 PDF 文件");
+    throwIfAborted(options.abortSignal);
 
     // 如果 baseUrl 已经以 /responses 结尾，直接使用；否则追加
     const endpoint = baseUrl.endsWith("/responses")
@@ -716,6 +820,8 @@ export class VolcanoArkProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -726,7 +832,15 @@ export class VolcanoArkProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -790,6 +904,9 @@ export class VolcanoArkProvider implements ILlmProvider {
         },
       });
     } catch (error: any) {
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
       let errorMessage = error?.message || "火山引擎请求失败";
       try {
         const responseText =
@@ -809,6 +926,8 @@ export class VolcanoArkProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");

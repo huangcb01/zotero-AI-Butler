@@ -1,7 +1,29 @@
 import { ILlmProvider } from "./ILlmProvider";
-import { ConversationMessage, LLMOptions, ProgressCb } from "./types";
+import {
+  ConversationMessage,
+  LLMOptions,
+  LLMModelInfo,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
+import {
+  getConnectionTestInput,
+  getConnectionTestModeLabel,
+} from "./shared/connectionTest";
+import {
+  deriveVersionedModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import {
+  bindAbortSignal,
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./shared/requestAbort";
+import { resolveOpenRouterReasoningEffort } from "./shared/reasoning";
 
 /**
  * OpenRouter Provider
@@ -10,15 +32,41 @@ import { getRequestTimeoutMs } from "./shared/llmutils";
  */
 export class OpenRouterProvider implements ILlmProvider {
   readonly id = "openrouter";
+  readonly capabilities: LLMProviderCapabilities = {
+    supportsText: true,
+    supportsStreaming: true,
+    supportsPdfBase64: true,
+    maxPdfFiles: 20,
+    supportsSystemPrompt: true,
+    supportedParams: [
+      "temperature",
+      "topP",
+      "maxTokens",
+      "stream",
+      "reasoningEffort",
+    ],
+  };
 
   private ensureUrlAndKey(options: LLMOptions) {
-    const apiUrl = (
+    const rawApiUrl = (
       options.apiUrl || "https://openrouter.ai/api/v1/chat/completions"
     ).trim();
+    const apiUrl = this.normalizeChatCompletionsUrl(rawApiUrl);
     const apiKey = (options.apiKey || "").trim();
     if (!apiUrl) throw new Error("API URL 未配置");
     if (!apiKey) throw new Error("API Key 未配置");
     return { apiUrl, apiKey };
+  }
+
+  private normalizeChatCompletionsUrl(apiUrl: string): string {
+    const raw = apiUrl.trim().replace(/\/+$/, "");
+    if (!raw) return raw;
+    if (/\/(?:v\d+(?:beta)?\/)?chat\/completions$/i.test(raw)) return raw;
+    if (/\/v\d+(?:beta)?$/i.test(raw)) return `${raw}/chat/completions`;
+    if (/\/v\d+(?:beta)?\/.+$/i.test(raw)) {
+      return raw.replace(/(\/v\d+(?:beta)?)(?:\/.*)?$/i, "$1/chat/completions");
+    }
+    return `${raw}/v1/chat/completions`;
   }
 
   private buildHeaders(apiKey: string) {
@@ -36,6 +84,10 @@ export class OpenRouterProvider implements ILlmProvider {
       params.temperature = options.temperature;
     if (options.topP !== undefined) params.top_p = options.topP;
     if (options.maxTokens !== undefined) params.max_tokens = options.maxTokens;
+    const reasoningEffort = resolveOpenRouterReasoningEffort(
+      options.reasoningEffort,
+    );
+    if (reasoningEffort) params.reasoning = { effort: reasoningEffort };
     return params;
   }
 
@@ -167,6 +219,19 @@ export class OpenRouterProvider implements ILlmProvider {
   async testConnection(options: LLMOptions): Promise<string> {
     const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
     const model = (options.model || "google/gemma-3-27b-it").trim();
+    const testInput = getConnectionTestInput(options);
+    const userContent = testInput.isBase64
+      ? [
+          { type: "text", text: testInput.text },
+          {
+            type: "file",
+            file: {
+              filename: "connection-test.pdf",
+              file_data: testInput.pdfBase64 || "",
+            },
+          },
+        ]
+      : testInput.text;
 
     const payload = {
       model,
@@ -175,7 +240,7 @@ export class OpenRouterProvider implements ILlmProvider {
         { role: "system", content: SYSTEM_ROLE_PROMPT },
         {
           role: "user",
-          content: "Hello! Please respond with 'OK' to confirm connection.",
+          content: userContent,
         },
       ],
       ...this.buildGenParams(options),
@@ -191,6 +256,7 @@ export class OpenRouterProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? 30000,
+        errorDelayMax: 0,
       });
 
       // Extract headers
@@ -265,7 +331,7 @@ export class OpenRouterProvider implements ILlmProvider {
       const json =
         typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
       const content = json?.choices?.[0]?.message?.content || "";
-      return `✅ Connection Successful!\nModel: ${model}\nResponse: ${content}\n\n--- Raw Response ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ Connection Successful!\nModel: ${model}\nResponse: ${content}\n\n--- Raw Response ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
     }
 
     const { APITestError } = await import("./types");
@@ -280,6 +346,20 @@ export class OpenRouterProvider implements ILlmProvider {
     });
   }
 
+  async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
+    const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
+    const url = deriveVersionedModelsUrl(
+      apiUrl,
+      "https://openrouter.ai/api/v1/chat/completions",
+    );
+    const data = await requestModelListJson(
+      url,
+      this.buildHeaders(apiKey),
+      options.requestTimeoutMs ?? 30000,
+    );
+    return parseModelListResponse(data);
+  }
+
   // --- Helpers ---
 
   private async streamRequest(
@@ -289,6 +369,7 @@ export class OpenRouterProvider implements ILlmProvider {
     options: LLMOptions,
     onProgress?: ProgressCb,
   ): Promise<string> {
+    throwIfAborted(options.abortSignal);
     const payloadWithStream = { ...payload, stream: true };
     const chunks: string[] = [];
     let delivered = 0;
@@ -296,6 +377,7 @@ export class OpenRouterProvider implements ILlmProvider {
     let partialLine = "";
     let gotAnyDelta = false;
     let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -303,7 +385,15 @@ export class OpenRouterProvider implements ILlmProvider {
         body: JSON.stringify(payloadWithStream),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -382,13 +472,21 @@ export class OpenRouterProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       const errorMessage = error?.message || "OpenRouter request failed";
       // ... Error parsing ...
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
     return chunks.join("");
   }
@@ -400,22 +498,41 @@ export class OpenRouterProvider implements ILlmProvider {
     options: LLMOptions,
     onProgress?: ProgressCb,
   ): Promise<string> {
+    throwIfAborted(options.abortSignal);
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
     try {
       const res = await Zotero.HTTP.request("POST", apiUrl, {
         headers: this.buildHeaders(apiKey),
         body: JSON.stringify(payload),
         responseType: "json",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
+        requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
+        },
       });
+      throwIfAborted(options.abortSignal);
       const data = res.response || res;
       const text = data?.choices?.[0]?.message?.content || "";
       const result = typeof text === "string" ? text : JSON.stringify(text);
       if (onProgress && result) await onProgress(result);
       return result;
     } catch (e: any) {
+      if (abortError || isAbortError(e, options.abortSignal)) {
+        throw normalizeAbortError(abortError || e, options.abortSignal);
+      }
       // ... Error handling ...
       const msg = e?.message || "OpenRouter request failed";
       throw new Error(msg);
+    } finally {
+      cleanupAbortSignal?.();
     }
   }
 

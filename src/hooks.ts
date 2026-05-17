@@ -28,8 +28,21 @@ import { createZToolkit } from "./utils/ztoolkit";
 import { TaskQueueManager } from "./modules/taskQueue";
 import { MainWindow } from "./modules/views/MainWindow";
 import { AutoScanManager } from "./modules/autoScanManager";
+import {
+  CONTEXT_MENU_ITEMS,
+  DEFAULT_CONTEXT_MENU_COLLAPSED,
+  DEFAULT_CONTEXT_MENU_ITEM_ORDER_PREF,
+  DEFAULT_CONTEXT_MENU_ITEM_VISIBILITY_PREF,
+  DEFAULT_SIDEBAR_MODULE_ORDER_PREF,
+  DEFAULT_SIDEBAR_MODULE_VISIBILITY_PREF,
+  getContextMenuItemOrder,
+  isContextMenuCollapsed,
+  isContextMenuItemEnabled,
+  type ContextMenuItemId,
+} from "./modules/uiCustomization";
 import { config } from "../package.json";
 import { getPref, setPref } from "./utils/prefs";
+import { LLMEndpointManager } from "./modules/llmEndpointManager";
 import {
   getDefaultSummaryPrompt,
   PROMPT_VERSION,
@@ -130,6 +143,7 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
   // 注册右键上下文菜单
   // 为用户提供快速访问插件功能的入口
   registerContextMenuItem();
+  bindUICustomizationRefreshEvent(win);
 
   // 注册文献库工具栏按钮
   // 用户可以在文献库界面快速访问 AI 管家
@@ -211,19 +225,35 @@ function initializeDefaultPrefsOnStartup() {
     openRouterApiUrl: "https://openrouter.ai/api/v1/chat/completions",
     openRouterApiKey: "",
     openRouterModel: "google/gemma-3-27b-it",
+    ollamaApiUrl: "http://localhost:11434",
+    ollamaApiKey: "",
+    ollamaModel: "llama3.2",
+    llmEndpoints: "[]",
+    llmRoutingStrategy: "priority",
+    llmRoundRobinCursor: "",
+    multiModelSummaryEnabled: false,
+    multiModelSummaryEndpointIds: "[]",
     // 备用 API 密钥列表（JSON 数组格式）
     openaiApiKeysFallback: "[]",
     openaiCompatApiKeysFallback: "[]",
     geminiApiKeysFallback: "[]",
     anthropicApiKeysFallback: "[]",
     openRouterApiKeysFallback: "[]",
+    volcanoArkApiKeysFallback: "[]",
+    ollamaApiKeysFallback: "[]",
     // API 轮换配置
     maxApiSwitchCount: "3", // 最大切换次数
     failedKeyCooldown: "300000", // 失败密钥冷却时间(毫秒)，默认5分钟
     temperature: "0.7", // 默认温度参数,平衡创造性和准确性
+    reasoningEffort: "default",
     stream: true, // 默认启用流式输出,提供更好的用户体验
     summaryPrompt: getDefaultSummaryPrompt(), // 加载默认提示词模板
     promptVersion: PROMPT_VERSION, // 当前提示词版本号
+    contextMenuCollapsed: DEFAULT_CONTEXT_MENU_COLLAPSED,
+    contextMenuItemVisibility: DEFAULT_CONTEXT_MENU_ITEM_VISIBILITY_PREF,
+    contextMenuItemOrder: DEFAULT_CONTEXT_MENU_ITEM_ORDER_PREF,
+    sidebarModuleVisibility: DEFAULT_SIDEBAR_MODULE_VISIBILITY_PREF,
+    sidebarModuleOrder: DEFAULT_SIDEBAR_MODULE_ORDER_PREF,
   };
 
   // 遍历所有配置项,确保每项都有有效值
@@ -271,6 +301,8 @@ function initializeDefaultPrefsOnStartup() {
       }
     }
   }
+
+  LLMEndpointManager.getEndpoints();
 }
 
 /**
@@ -282,6 +314,75 @@ function initializeDefaultPrefsOnStartup() {
 async function openAIButlerDashboardFromUnifiedEntry(): Promise<void> {
   const mainWin = MainWindow.getInstance();
   await mainWin.open("dashboard");
+}
+
+const UI_CUSTOMIZATION_CHANGED_EVENT = "ai-butler-ui-customization-changed";
+
+const CONTEXT_MENU_DOM_IDS: Record<ContextMenuItemId, string> = {
+  generateSummary: "zotero-itemmenu-ai-butler-summary",
+  multiRoundReanalyze: "zotero-itemmenu-ai-butler-multi-round",
+  dashboard: "zotero-itemmenu-ai-butler-dashboard",
+  chatWithAI: "zotero-itemmenu-ai-butler-chat",
+  imageSummary: "zotero-itemmenu-ai-butler-image-summary",
+  mindmap: "zotero-itemmenu-ai-butler-mindmap",
+  fillTable: "zotero-itemmenu-ai-butler-fill-table",
+  literatureReview: "zotero-collectionmenu-ai-butler-literature-review",
+};
+
+type ContextMenuScope = "item" | "collection";
+type ContextMenuDefinition = {
+  scope: ContextMenuScope;
+  options: any;
+};
+
+const CONTEXT_MENU_ROOT_DOM_IDS: Record<ContextMenuScope, string> = {
+  item: "zotero-itemmenu-ai-butler-root",
+  collection: "zotero-collectionmenu-ai-butler-root",
+};
+
+function unregisterContextMenuItems(menu: {
+  unregister?: (menuId: string) => void;
+}): void {
+  if (typeof menu.unregister !== "function") return;
+  for (const menuId of Object.values(CONTEXT_MENU_ROOT_DOM_IDS)) {
+    menu.unregister(menuId);
+  }
+  for (const item of CONTEXT_MENU_ITEMS) {
+    menu.unregister(CONTEXT_MENU_DOM_IDS[item.id]);
+  }
+}
+
+async function isContextMenuOptionVisible(
+  option: any,
+  ev: Event,
+): Promise<boolean> {
+  try {
+    if (option.hidden) return false;
+    if (typeof option.isHidden === "function") {
+      return (await option.isHidden(undefined, ev)) !== true;
+    }
+    if (typeof option.getVisibility === "function") {
+      return (await option.getVisibility(undefined, ev)) !== false;
+    }
+    return true;
+  } catch (error) {
+    ztoolkit.log("[AI-Butler] 判断右键菜单项可见性失败:", error);
+    return false;
+  }
+}
+
+export function refreshAIButlerContextMenuItems(): void {
+  registerContextMenuItem();
+}
+
+function bindUICustomizationRefreshEvent(win: Window): void {
+  const flagKey = "__aiButlerUICustomizationRefreshBound";
+  if ((win as any)[flagKey]) return;
+  (win as any)[flagKey] = true;
+
+  win.addEventListener(UI_CUSTOMIZATION_CHANGED_EVENT, () => {
+    refreshAIButlerContextMenuItems();
+  });
 }
 
 /**
@@ -303,166 +404,189 @@ async function openAIButlerDashboardFromUnifiedEntry(): Promise<void> {
 function registerContextMenuItem() {
   // 获取插件图标路径,用于菜单项显示
   const menuIcon = `chrome://${config.addonRef}/content/icons/favicon.png`;
+  const menu = (ztoolkit as any).Menu as {
+    register: (scope: ContextMenuScope, options: any) => void;
+    unregister?: (menuId: string) => void;
+  };
 
-  // 注册"生成AI总结"菜单项
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem", // HTML 元素类型
-    label: getString("menuitem-generateSummary"), // 国际化的菜单文本
-    icon: menuIcon, // 菜单项图标
+  unregisterContextMenuItems(menu);
 
-    // 点击事件监听器
-    commandListener: (ev) => {
-      handleGenerateSummary();
-    },
+  const isRegularItemSelection = () => {
+    const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
+    return (
+      selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) || false
+    );
+  };
 
-    getVisibility: () => {
-      const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
-      return (
-        selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) ||
-        false
-      );
-    },
-  });
-
-  // 注册"AI管家多轮对话重新精读"菜单项 (包含子菜单)
-  ztoolkit.Menu.register("item", {
-    tag: "menu", // 使用 menu 标签创建子菜单
-    label: getString("menuitem-multiRoundReanalyze" as any),
-    icon: menuIcon,
-    children: [
-      {
+  const menuDefinitions: Record<ContextMenuItemId, ContextMenuDefinition> = {
+    generateSummary: {
+      scope: "item",
+      options: {
         tag: "menuitem",
-        label: getString("menuitem-multiRoundConcat" as any),
-        commandListener: () => handleMultiRoundSummary("multi_concat"),
+        id: CONTEXT_MENU_DOM_IDS.generateSummary,
+        label: getString("menuitem-generateSummary"),
+        icon: menuIcon,
+        commandListener: (_ev: Event) => {
+          handleGenerateSummary();
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("generateSummary") &&
+          isRegularItemSelection(),
       },
-      {
+    },
+    multiRoundReanalyze: {
+      scope: "item",
+      options: {
+        tag: "menu",
+        id: CONTEXT_MENU_DOM_IDS.multiRoundReanalyze,
+        label: getString("menuitem-multiRoundReanalyze" as any),
+        icon: menuIcon,
+        children: [
+          {
+            tag: "menuitem",
+            label: getString("menuitem-multiRoundConcat" as any),
+            commandListener: () => handleMultiRoundSummary("multi_concat"),
+          },
+          {
+            tag: "menuitem",
+            label: getString("menuitem-multiRoundSummary" as any),
+            commandListener: () => handleMultiRoundSummary("multi_summarize"),
+          },
+        ],
+        getVisibility: () =>
+          isContextMenuItemEnabled("multiRoundReanalyze") &&
+          isRegularItemSelection(),
+      },
+    },
+    dashboard: {
+      scope: "item",
+      options: {
         tag: "menuitem",
-        label: getString("menuitem-multiRoundSummary" as any),
-        commandListener: () => handleMultiRoundSummary("multi_summarize"),
+        id: CONTEXT_MENU_DOM_IDS.dashboard,
+        label: "AI 管家仪表盘",
+        icon: menuIcon,
+        commandListener: async (_ev: Event) => {
+          await openAIButlerDashboardFromUnifiedEntry();
+        },
+        getVisibility: () => isContextMenuItemEnabled("dashboard"),
       },
-    ],
-    getVisibility: () => {
-      // 与生成总结的可见性逻辑相同
-      const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
-      return (
-        selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) ||
-        false
-      );
     },
-  });
+    chatWithAI: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_DOM_IDS.chatWithAI,
+        label: getString("menuitem-chatWithAI"),
+        icon: menuIcon,
+        commandListener: async (_ev: Event) => {
+          await handleChatWithAI();
+        },
+        getVisibility: () => {
+          if (!isContextMenuItemEnabled("chatWithAI")) return false;
+          const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
+          if (!selectedItems || selectedItems.length !== 1) return false;
 
-  // 注册"AI 管家仪表盘"菜单项
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem",
-    label: "AI 管家仪表盘",
-    icon: menuIcon,
+          const item = selectedItems[0];
+          if (!item.isNote()) return false;
 
-    commandListener: async (ev) => {
-      await openAIButlerDashboardFromUnifiedEntry();
+          const tags: Array<{ tag: string }> = (item as any).getTags?.() || [];
+          const hasTag = tags.some((t: any) => t.tag === "AI-Generated");
+          const noteHtml: string = (item as any).getNote?.() || "";
+          const titleMatch = /<h2>\s*AI 管家\s*-/.test(noteHtml);
+          return hasTag || titleMatch;
+        },
+      },
     },
-
-    getVisibility: () => {
-      return true; // 始终显示
+    imageSummary: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_DOM_IDS.imageSummary,
+        label: getString("menuitem-imageSummary"),
+        icon: menuIcon,
+        commandListener: async () => {
+          await handleImageSummary();
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("imageSummary") && isRegularItemSelection(),
+      },
     },
-  });
-
-  // 注册"AI 管家-后续追问"菜单项
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem",
-    label: getString("menuitem-chatWithAI"),
-    icon: menuIcon,
-
-    commandListener: async (ev) => {
-      await handleChatWithAI();
+    mindmap: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_DOM_IDS.mindmap,
+        label: getString("menuitem-mindmap" as any),
+        icon: menuIcon,
+        commandListener: async () => {
+          await handleMindmapGeneration();
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("mindmap") && isRegularItemSelection(),
+      },
     },
-
-    // 仅当选中单个 AI 笔记时显示
-    getVisibility: () => {
-      const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
-      if (!selectedItems || selectedItems.length !== 1) {
-        return false;
-      }
-
-      const item = selectedItems[0];
-      // 判断是否是 AI 笔记
-      if (!item.isNote()) {
-        return false;
-      }
-
-      const tags: Array<{ tag: string }> = (item as any).getTags?.() || [];
-      const hasTag = tags.some((t: any) => t.tag === "AI-Generated");
-      const noteHtml: string = (item as any).getNote?.() || "";
-      const titleMatch = /<h2>\s*AI 管家\s*-/.test(noteHtml);
-
-      return hasTag || titleMatch;
+    fillTable: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_DOM_IDS.fillTable,
+        label: getString("menuitem-fillTable" as any),
+        icon: menuIcon,
+        commandListener: async () => {
+          await handleFillTable();
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("fillTable") && isRegularItemSelection(),
+      },
     },
-  });
-
-  // 注册"召唤AI管家一图总结"菜单项
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem",
-    label: getString("menuitem-imageSummary"),
-    icon: menuIcon,
-
-    commandListener: async () => {
-      await handleImageSummary();
+    literatureReview: {
+      scope: "collection",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_DOM_IDS.literatureReview,
+        label: getString("menuitem-literatureReview" as any),
+        icon: menuIcon,
+        commandListener: async () => {
+          await handleLiteratureReview();
+        },
+        getVisibility: () => isContextMenuItemEnabled("literatureReview"),
+      },
     },
+  };
 
-    getVisibility: () => {
-      const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
-      return (
-        selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) ||
-        false
-      );
-    },
-  });
+  const orderedDefinitions = getContextMenuItemOrder()
+    .map((itemId) => menuDefinitions[itemId])
+    .filter((definition): definition is ContextMenuDefinition =>
+      Boolean(definition),
+    );
 
-  // 注册"AI管家生成思维导图"菜单项
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem",
-    label: getString("menuitem-mindmap" as any),
-    icon: menuIcon,
+  if (isContextMenuCollapsed()) {
+    for (const scope of ["item", "collection"] as const) {
+      const children = orderedDefinitions
+        .filter((definition) => definition.scope === scope)
+        .map((definition) => definition.options);
+      if (!children.length) continue;
 
-    commandListener: async () => {
-      await handleMindmapGeneration();
-    },
+      menu.register(scope, {
+        tag: "menu",
+        id: CONTEXT_MENU_ROOT_DOM_IDS[scope],
+        label: "AI 管家",
+        icon: menuIcon,
+        children,
+        getVisibility: async (_elem: XUL.Menu, ev: Event) => {
+          for (const child of children) {
+            if (await isContextMenuOptionVisible(child, ev)) return true;
+          }
+          return false;
+        },
+      });
+    }
+    return;
+  }
 
-    getVisibility: () => {
-      const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
-      return (
-        selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) ||
-        false
-      );
-    },
-  });
-
-  // 注册"AI管家文献综述"菜单项 (分类右键)
-  ztoolkit.Menu.register("collection", {
-    tag: "menuitem",
-    label: getString("menuitem-literatureReview" as any),
-    icon: menuIcon,
-    commandListener: async () => {
-      await handleLiteratureReview();
-    },
-    getVisibility: () => true, // 分类菜单始终显示
-  });
-
-  // 注册"AI管家填表"菜单项 (文献右键)
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem",
-    label: getString("menuitem-fillTable" as any),
-    icon: menuIcon,
-    commandListener: async () => {
-      await handleFillTable();
-    },
-    getVisibility: () => {
-      const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
-      return (
-        selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) ||
-        false
-      );
-    },
-  });
+  for (const definition of orderedDefinitions) {
+    menu.register(definition.scope, definition.options);
+  }
 }
 
 /**
@@ -867,63 +991,24 @@ async function handleChatWithAI() {
  */
 async function handleGenerateSummary() {
   // 第一步:验证 API 配置
-  // 根据当前选择的 provider 检查相应的 API 密钥
-  const provider =
-    (Zotero.Prefs.get(`${config.prefsPrefix}.provider`, true) as string) ||
-    "openai";
-  let selectedApiKey: string | undefined;
-  let providerName: string;
+  // 新版本以用户配置的 endpoint 列表作为主路由来源。
+  const enabledEndpoints = LLMEndpointManager.getEnabledEndpoints();
+  const hasUsableEndpoint = enabledEndpoints.some(
+    (endpoint) =>
+      endpoint.apiUrl.trim() &&
+      endpoint.model.trim() &&
+      (endpoint.apiKey.trim() ||
+        LLMEndpointManager.providerAllowsEmptyApiKey(endpoint.providerType)),
+  );
 
-  const pLower = (provider || "").toLowerCase();
-  if (provider === "google" || pLower.includes("gemini")) {
-    selectedApiKey = Zotero.Prefs.get(
-      `${config.prefsPrefix}.geminiApiKey`,
-      true,
-    ) as string;
-    providerName = "Gemini";
-  } else if (provider === "anthropic" || pLower.includes("claude")) {
-    selectedApiKey = Zotero.Prefs.get(
-      `${config.prefsPrefix}.anthropicApiKey`,
-      true,
-    ) as string;
-    providerName = "Anthropic";
-  } else if (pLower === "openai-compat") {
-    // 支持 OpenAI 兼容接口 (旧 /v1/chat/completions)，优先读取专用密钥，回退到 OpenAI 密钥
-    selectedApiKey =
-      (Zotero.Prefs.get(
-        `${config.prefsPrefix}.openaiCompatApiKey`,
-        true,
-      ) as string) ||
-      (Zotero.Prefs.get(`${config.prefsPrefix}.openaiApiKey`, true) as string);
-    providerName = "OpenAI 兼容"; // 提示更明确
-  } else if (pLower === "openrouter") {
-    selectedApiKey = Zotero.Prefs.get(
-      `${config.prefsPrefix}.openRouterApiKey`,
-      true,
-    ) as string;
-    providerName = "OpenRouter";
-  } else if (pLower === "volcanoark") {
-    selectedApiKey = Zotero.Prefs.get(
-      `${config.prefsPrefix}.volcanoArkApiKey`,
-      true,
-    ) as string;
-    providerName = "火山方舟";
-  } else {
-    selectedApiKey = Zotero.Prefs.get(
-      `${config.prefsPrefix}.openaiApiKey`,
-      true,
-    ) as string;
-    providerName = "OpenAI";
-  }
-
-  if (!selectedApiKey) {
+  if (!hasUsableEndpoint) {
     // API 未配置,显示友好的错误提示
     new ztoolkit.ProgressWindow("AI Butler", {
       closeOnClick: true,
       closeTime: 5000, // 5秒后自动关闭
     })
       .createLine({
-        text: `请先在设置中配置 ${providerName} API Key`,
+        text: "请先在设置中配置至少一个启用的 LLM Endpoint",
         type: "error",
       })
       .show();

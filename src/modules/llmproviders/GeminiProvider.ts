@@ -1,10 +1,39 @@
 import { ILlmProvider } from "./ILlmProvider";
-import { ConversationMessage, LLMOptions, ProgressCb } from "./types";
+import {
+  ConversationMessage,
+  LLMOptions,
+  LLMModelInfo,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
+import {
+  getConnectionTestInput,
+  getConnectionTestModeLabel,
+} from "./shared/connectionTest";
+import {
+  deriveGeminiModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import {
+  bindAbortSignal,
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./shared/requestAbort";
 
 export class GeminiProvider implements ILlmProvider {
   readonly id = "google"; // 同步现有 provider 识别：google/gemini
+  readonly capabilities: LLMProviderCapabilities = {
+    supportsText: true,
+    supportsStreaming: true,
+    supportsPdfBase64: true,
+    maxPdfFiles: 20,
+    supportsSystemPrompt: true,
+    supportedParams: ["temperature", "topP", "maxTokens", "stream"],
+  };
 
   async generateSummary(
     content: string,
@@ -24,6 +53,7 @@ export class GeminiProvider implements ILlmProvider {
 
     if (!baseUrl) throw new Error("Gemini API URL 未配置");
     if (!apiKey) throw new Error("Gemini API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
     const endpoint = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 
@@ -68,6 +98,8 @@ export class GeminiProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -78,7 +110,15 @@ export class GeminiProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -143,6 +183,9 @@ export class GeminiProvider implements ILlmProvider {
         },
       });
     } catch (error: any) {
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
       let errorMessage = error?.message || "Gemini 请求失败";
       try {
         const responseText =
@@ -162,6 +205,8 @@ export class GeminiProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");
@@ -185,6 +230,7 @@ export class GeminiProvider implements ILlmProvider {
 
     if (!baseUrl) throw new Error("Gemini API URL 未配置");
     if (!apiKey) throw new Error("Gemini API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
     const endpoint = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 
@@ -236,6 +282,7 @@ export class GeminiProvider implements ILlmProvider {
     let partialLine = "";
     let abortError: Error | null = null;
     let gotAnyDelta = false;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -246,7 +293,15 @@ export class GeminiProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -332,10 +387,16 @@ export class GeminiProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) {
           return chunks.join("");
         }
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "Gemini 请求失败";
       try {
@@ -361,9 +422,28 @@ export class GeminiProvider implements ILlmProvider {
       });
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     return chunks.join("");
+  }
+
+  async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
+    const baseUrl = (
+      options.apiUrl || "https://generativelanguage.googleapis.com"
+    ).replace(/\/+$/, "");
+    const apiKey = (options.apiKey || "").trim();
+    if (!baseUrl) throw new Error("Gemini API URL 未配置");
+    if (!apiKey) throw new Error("Gemini API Key 未配置");
+
+    const url = deriveGeminiModelsUrl(baseUrl);
+    const data = await requestModelListJson(
+      url,
+      { "x-goog-api-key": apiKey },
+      options.requestTimeoutMs ?? 30000,
+    );
+    return parseModelListResponse(data, { stripModelsPrefix: true });
   }
 
   async testConnection(options: LLMOptions): Promise<string> {
@@ -376,13 +456,21 @@ export class GeminiProvider implements ILlmProvider {
     if (!apiKey) throw new Error("Gemini API Key 未配置");
 
     const url = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const testInput = getConnectionTestInput(options);
+    const parts: any[] = [{ text: testInput.text }];
+    if (testInput.isBase64) {
+      parts.push({
+        inlineData: {
+          mimeType: "application/pdf",
+          data: testInput.pdfBase64 || "",
+        },
+      });
+    }
     const payload = {
       contents: [
         {
           role: "user",
-          parts: [
-            { text: "Hello! Please respond with 'OK' to confirm connection." },
-          ],
+          parts,
         },
       ],
       systemInstruction: { parts: [{ text: SYSTEM_ROLE_PROMPT }] },
@@ -399,6 +487,7 @@ export class GeminiProvider implements ILlmProvider {
           "x-goog-api-key": apiKey,
         },
         body: JSON.stringify(payload),
+        errorDelayMax: 0,
         responseType: "text", // 使用 text 以获取原始响应
         timeout: 30000,
       });
@@ -476,7 +565,7 @@ export class GeminiProvider implements ILlmProvider {
         json?.candidates?.[0]?.content?.parts
           ?.map((p: any) => p?.text || "")
           .join("") || "";
-      return `✅ 连接成功!\n模型: ${model}\n响应: ${text}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ 连接成功!\n模型: ${model}\n响应: ${text}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
     }
 
     // 非 200 但未抛出异常的情况
@@ -561,6 +650,7 @@ export class GeminiProvider implements ILlmProvider {
         }),
         responseType: "text",
         timeout: 60000,
+        errorDelayMax: 0,
       });
 
       // 从响应头获取上传 URL
@@ -586,6 +676,7 @@ export class GeminiProvider implements ILlmProvider {
         body: new Uint8Array(fileData),
         responseType: "json",
         timeout: 120000, // 文件上传可能需要更长时间
+        errorDelayMax: 0,
       });
 
       const fileInfo = uploadResponse.response;
@@ -628,6 +719,7 @@ export class GeminiProvider implements ILlmProvider {
     if (!baseUrl) throw new Error("Gemini API URL 未配置");
     if (!apiKey) throw new Error("Gemini API Key 未配置");
     if (pdfFiles.length === 0) throw new Error("没有要处理的 PDF 文件");
+    throwIfAborted(options.abortSignal);
 
     // 构建 inline_data 部分
     const fileParts: any[] = [];
@@ -689,6 +781,8 @@ export class GeminiProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -699,7 +793,15 @@ export class GeminiProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -763,6 +865,9 @@ export class GeminiProvider implements ILlmProvider {
         },
       });
     } catch (error: any) {
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
       let errorMessage = error?.message || "Gemini 请求失败";
       try {
         const responseText =
@@ -782,6 +887,8 @@ export class GeminiProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");

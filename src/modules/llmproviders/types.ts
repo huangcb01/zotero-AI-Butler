@@ -1,9 +1,31 @@
 export type ProgressCb = (chunk: string) => Promise<void> | void;
 
+export type LLMAbortSignal = {
+  readonly aborted: boolean;
+  readonly reason?: unknown;
+  addEventListener?(
+    type: "abort",
+    listener: () => void,
+    options?: { once?: boolean } | boolean,
+  ): void;
+  removeEventListener?(type: "abort", listener: () => void): void;
+  throwIfAborted?(): void;
+};
+
 export type ConversationMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
+
+export type LLMReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh";
+
+export type LLMReasoningEffortSetting = "default" | LLMReasoningEffort;
 
 export type LLMOptions = {
   apiUrl?: string;
@@ -14,7 +36,56 @@ export type LLMOptions = {
   temperature?: number;
   topP?: number;
   maxTokens?: number;
+  reasoningEffort?: LLMReasoningEffort;
   vendorOptions?: Record<string, unknown>;
+  abortSignal?: LLMAbortSignal;
+};
+
+export type LLMProviderParam =
+  | "temperature"
+  | "topP"
+  | "maxTokens"
+  | "stream"
+  | "reasoningEffort"
+  | "verbosity"
+  | "responseFormat";
+
+export type LLMProviderCapabilities = {
+  supportsText: boolean;
+  supportsStreaming: boolean;
+  supportsPdfBase64: boolean;
+  maxPdfFiles: number;
+  supportsSystemPrompt: boolean;
+  supportedParams: LLMProviderParam[];
+};
+
+export type LLMModelInfo = {
+  id: string;
+  name?: string;
+  description?: string;
+  contextLength?: number;
+  ownedBy?: string;
+  created?: number;
+};
+
+export type LLMUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+};
+
+export type LLMResponse = {
+  text: string;
+  providerId: string;
+  endpointId?: string;
+  providerName?: string;
+  model?: string;
+  generatedAt?: string;
+  requestId?: string;
+  usage?: LLMUsage;
+  finishReason?: string;
+  warnings?: string[];
+  rawExcerpt?: string;
 };
 
 export type LLMError = {

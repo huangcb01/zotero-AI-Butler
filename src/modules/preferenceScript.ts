@@ -9,6 +9,13 @@ import {
 } from "../utils/prompts";
 import { MainWindow } from "./views/MainWindow";
 import { config } from "../../package.json";
+import {
+  DEFAULT_CONTEXT_MENU_COLLAPSED,
+  DEFAULT_CONTEXT_MENU_ITEM_ORDER_PREF,
+  DEFAULT_CONTEXT_MENU_ITEM_VISIBILITY_PREF,
+  DEFAULT_SIDEBAR_MODULE_ORDER_PREF,
+  DEFAULT_SIDEBAR_MODULE_VISIBILITY_PREF,
+} from "./uiCustomization";
 
 export async function registerPrefsScripts(_window: Window) {
   const slog = (...args: any[]) => {
@@ -216,6 +223,7 @@ function initializeDefaultPrefs() {
     openaiApiUrl: "https://api.openai.com/v1/responses",
     openaiApiModel: "gpt-5",
     temperature: "0.7",
+    reasoningEffort: "default",
     stream: true,
     summaryPrompt: getDefaultSummaryPrompt(),
     promptVersion: PROMPT_VERSION,
@@ -226,6 +234,11 @@ function initializeDefaultPrefs() {
     enableTableOnSingleNote: true,
     tableStrategy: "skip",
     tableFillConcurrency: 3,
+    contextMenuCollapsed: DEFAULT_CONTEXT_MENU_COLLAPSED,
+    contextMenuItemVisibility: DEFAULT_CONTEXT_MENU_ITEM_VISIBILITY_PREF,
+    contextMenuItemOrder: DEFAULT_CONTEXT_MENU_ITEM_ORDER_PREF,
+    sidebarModuleVisibility: DEFAULT_SIDEBAR_MODULE_VISIBILITY_PREF,
+    sidebarModuleOrder: DEFAULT_SIDEBAR_MODULE_ORDER_PREF,
   };
 
   // 遍历所有默认配置

@@ -1,10 +1,39 @@
 import { ILlmProvider } from "./ILlmProvider";
-import { ConversationMessage, LLMOptions, ProgressCb } from "./types";
+import {
+  ConversationMessage,
+  LLMOptions,
+  LLMModelInfo,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
+import {
+  getConnectionTestInput,
+  getConnectionTestModeLabel,
+} from "./shared/connectionTest";
+import {
+  deriveAnthropicModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import {
+  bindAbortSignal,
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./shared/requestAbort";
 
 export class AnthropicProvider implements ILlmProvider {
   readonly id = "anthropic";
+  readonly capabilities: LLMProviderCapabilities = {
+    supportsText: true,
+    supportsStreaming: true,
+    supportsPdfBase64: true,
+    maxPdfFiles: 20,
+    supportsSystemPrompt: true,
+    supportedParams: ["temperature", "maxTokens", "stream"],
+  };
 
   async generateSummary(
     content: string,
@@ -24,6 +53,7 @@ export class AnthropicProvider implements ILlmProvider {
 
     if (!baseUrl) throw new Error("Anthropic API URL 未配置");
     if (!apiKey) throw new Error("Anthropic API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
     const endpoint = `${baseUrl}/v1/messages`;
 
@@ -71,6 +101,8 @@ export class AnthropicProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -82,7 +114,15 @@ export class AnthropicProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -149,6 +189,9 @@ export class AnthropicProvider implements ILlmProvider {
         },
       });
     } catch (error: any) {
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
       let errorMessage = error?.message || "Anthropic 请求失败";
       try {
         const responseText =
@@ -168,6 +211,8 @@ export class AnthropicProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");
@@ -193,6 +238,7 @@ export class AnthropicProvider implements ILlmProvider {
 
     if (!baseUrl) throw new Error("Anthropic API URL 未配置");
     if (!apiKey) throw new Error("Anthropic API Key 未配置");
+    throwIfAborted(options.abortSignal);
 
     const endpoint = `${baseUrl}/v1/messages`;
 
@@ -250,6 +296,7 @@ export class AnthropicProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -261,7 +308,15 @@ export class AnthropicProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -337,7 +392,9 @@ export class AnthropicProvider implements ILlmProvider {
         },
       });
     } catch (error: any) {
-      if (abortError) throw abortError;
+      if (abortError || isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(abortError || error, options.abortSignal);
+      }
       let errorMessage = error?.message || "Anthropic 请求失败";
       try {
         const responseText =
@@ -361,9 +418,32 @@ export class AnthropicProvider implements ILlmProvider {
         message: errorMessage,
       });
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     return chunks.join("");
+  }
+
+  async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
+    const baseUrl = (options.apiUrl || "https://api.anthropic.com").replace(
+      /\/+$/,
+      "",
+    );
+    const apiKey = (options.apiKey || "").trim();
+    if (!baseUrl) throw new Error("Anthropic API URL 未配置");
+    if (!apiKey) throw new Error("Anthropic API Key 未配置");
+
+    const url = deriveAnthropicModelsUrl(baseUrl);
+    const data = await requestModelListJson(
+      url,
+      {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      options.requestTimeoutMs ?? 30000,
+    );
+    return parseModelListResponse(data);
   }
 
   async testConnection(options: LLMOptions): Promise<string> {
@@ -377,13 +457,28 @@ export class AnthropicProvider implements ILlmProvider {
     if (!apiKey) throw new Error("Anthropic API Key 未配置");
 
     const url = `${baseUrl}/v1/messages`;
+    const testInput = getConnectionTestInput(options);
+    const userContent = testInput.isBase64
+      ? [
+          { type: "text", text: testInput.text },
+          {
+            type: "document",
+            source: {
+              type: "base64",
+              media_type: "application/pdf",
+              data: testInput.pdfBase64 || "",
+            },
+          },
+        ]
+      : testInput.text;
     const payload = {
       model,
       max_tokens: 16,
+      system: SYSTEM_ROLE_PROMPT,
       messages: [
         {
           role: "user",
-          content: "Hello! Please respond with 'OK' to confirm connection.",
+          content: userContent,
         },
       ],
     } as any;
@@ -399,6 +494,7 @@ export class AnthropicProvider implements ILlmProvider {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(payload),
+        errorDelayMax: 0,
         responseType: "text", // 使用 text 以获取原始响应
         timeout: 30000,
       });
@@ -472,7 +568,7 @@ export class AnthropicProvider implements ILlmProvider {
       const json =
         typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
       const text = json?.content?.[0]?.text || "";
-      return `✅ 连接成功!\n模型: ${model}\n响应: ${text}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ 连接成功!\n模型: ${model}\n响应: ${text}\n\n--- 原始响应 ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
     }
 
     const { APITestError } = await import("./types");
@@ -513,6 +609,7 @@ export class AnthropicProvider implements ILlmProvider {
     if (!baseUrl) throw new Error("Anthropic API URL 未配置");
     if (!apiKey) throw new Error("Anthropic API Key 未配置");
     if (pdfFiles.length === 0) throw new Error("没有要处理的 PDF 文件");
+    throwIfAborted(options.abortSignal);
 
     // 构建 document 部分
     const documentParts: any[] = [];
@@ -567,6 +664,7 @@ export class AnthropicProvider implements ILlmProvider {
     let partialLine = "";
     let gotAnyDelta = false;
     let abortError: Error | null = null;
+    let cleanupAbortSignal: (() => void) | undefined;
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -578,7 +676,15 @@ export class AnthropicProvider implements ILlmProvider {
         body: JSON.stringify(payload),
         responseType: "text",
         timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+        errorDelayMax: 0,
         requestObserver: (xmlhttp: XMLHttpRequest) => {
+          cleanupAbortSignal = bindAbortSignal(
+            options.abortSignal,
+            xmlhttp,
+            (error) => {
+              abortError = error;
+            },
+          );
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
@@ -659,8 +765,14 @@ export class AnthropicProvider implements ILlmProvider {
       });
     } catch (error: any) {
       if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
         if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "Anthropic 多文件请求失败";
       try {
@@ -681,6 +793,8 @@ export class AnthropicProvider implements ILlmProvider {
       }
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
+    } finally {
+      cleanupAbortSignal?.();
     }
 
     const streamed = chunks.join("");
