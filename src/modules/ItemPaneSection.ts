@@ -2903,6 +2903,46 @@ function renderChatArea(
   `;
   chatHeader.textContent = "💬 快速提问";
 
+  // 字体大小控制按钮
+  const fontControl = doc.createElement("span");
+  fontControl.style.cssText = `
+    float: right;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  `;
+
+  const fontDecBtn = doc.createElement("button");
+  fontDecBtn.textContent = "A-";
+  const fontIncBtn = doc.createElement("button");
+  fontIncBtn.textContent = "A+";
+  const fontSizeLabel = doc.createElement("span");
+
+  const fontBtnStyle = `
+    min-width: 24px;
+    height: 20px;
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font-size: 10px;
+    line-height: 1;
+  `;
+  fontDecBtn.style.cssText = fontBtnStyle;
+  fontIncBtn.style.cssText = fontBtnStyle;
+  fontSizeLabel.style.cssText = `
+    min-width: 30px;
+    text-align: center;
+    color: #666;
+    font-size: 10px;
+  `;
+
+  fontControl.appendChild(fontDecBtn);
+  fontControl.appendChild(fontSizeLabel);
+  fontControl.appendChild(fontIncBtn);
+  chatHeader.appendChild(fontControl);
+
   // 消息显示区
   const messagesArea = doc.createElement("div");
   messagesArea.style.cssText = `

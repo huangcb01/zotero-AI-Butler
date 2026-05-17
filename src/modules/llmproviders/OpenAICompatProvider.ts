@@ -96,15 +96,11 @@ export class OpenAICompatProvider implements ILlmProvider {
     const normalized = base64Content
       .trim()
       .replace(/^data:application\/pdf;base64,/i, "");
-    const safeFilename = filename.trim() || "document.pdf";
 
     return {
-      type: "file",
-      file: {
-        filename: /\.pdf$/i.test(safeFilename)
-          ? safeFilename
-          : `${safeFilename}.pdf`,
-        file_data: `data:application/pdf;base64,${normalized}`,
+      type: "image_url",
+      image_url: {
+        url: `data:application/pdf;base64,${normalized}`,
       },
     };
   }
