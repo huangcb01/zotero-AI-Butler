@@ -1198,9 +1198,27 @@ function renderItemPaneSection(
     font-size: 13px;
     width: 100%;
     max-width: 100%;
+    min-width: 0;
     overflow-x: hidden;
     box-sizing: border-box;
   `;
+
+  // 注入全局宽度约束样式（同步，确保在任何内容渲染前生效）
+  // 解决 Flex 布局 min-width:auto 导致内容不收缩的问题
+  let layoutStyle = doc.getElementById(
+    "ai-butler-sidebar-layout",
+  ) as HTMLStyleElement;
+  if (!layoutStyle) {
+    layoutStyle = doc.createElement("style");
+    layoutStyle.id = "ai-butler-sidebar-layout";
+    layoutStyle.textContent = `
+      /* Zotero 侧边栏 flex 容器链中的每一层都需要 min-width:0 才能正确收缩 */
+      item-pane-custom-section { min-width: 0 !important; }
+      item-pane-custom-section collapsible-section { min-width: 0 !important; }
+      item-pane-custom-section collapsible-section > [data-type="body"] { min-width: 0 !important; }
+    `;
+    (doc.body || doc.documentElement)?.appendChild(layoutStyle);
+  }
 
   // 检查是否有有效的文献条目
   if (!item || !item.isRegularItem()) {
@@ -1457,6 +1475,7 @@ function renderNoteSection(
     overflow: hidden;
     width: 100%;
     max-width: 100%;
+    min-width: 0;
     box-sizing: border-box;
   `;
 
@@ -1474,8 +1493,10 @@ function renderNoteSection(
     border-bottom: 1px solid rgba(128, 128, 128, 0.2);
     width: 100%;
     max-width: 100%;
+    min-width: 0;
     box-sizing: border-box;
-    overflow: hidden;
+    flex-wrap: wrap;
+    gap: 4px;
   `;
 
   const noteTitle = doc.createElement("span");
@@ -1486,6 +1507,9 @@ function renderNoteSection(
     display: flex;
     align-items: center;
     gap: 6px;
+    flex-shrink: 1;
+    min-width: 0;
+    overflow: hidden;
   `;
   noteTitle.innerHTML = `📄 <span>AI 笔记</span>`;
 
@@ -1493,8 +1517,8 @@ function renderNoteSection(
   metadataSelector.id = "ai-butler-note-metadata-selector";
   metadataSelector.style.cssText = `
     display: none;
-    max-width: 240px;
-    min-width: 96px;
+    max-width: 140px;
+    min-width: 60px;
     padding: 1px 12px 1px 4px;
     border: 1px solid rgba(128, 128, 128, 0.45);
     border-radius: 4px;
@@ -1504,6 +1528,7 @@ function renderNoteSection(
     font-weight: 400;
     line-height: 1.2;
     cursor: pointer;
+    flex-shrink: 1;
   `;
   metadataSelector.addEventListener("click", (e: Event) => e.stopPropagation());
   noteTitle.appendChild(metadataSelector);
@@ -1515,7 +1540,9 @@ function renderNoteSection(
     align-items: center;
     gap: 4px;
     margin-left: auto;
-    margin-right: 8px;
+    flex-shrink: 1;
+    min-width: 0;
+    flex-wrap: wrap;
   `;
   fontSizeControl.addEventListener("click", (e: Event) => e.stopPropagation());
 
@@ -1561,6 +1588,7 @@ function renderNoteSection(
     transition: height 0.2s ease;
     width: 100%;
     max-width: 100%;
+    min-width: 0;
     box-sizing: border-box;
   `;
 
@@ -1577,6 +1605,7 @@ function renderNoteSection(
     overflow-x: hidden;
     width: 100%;
     max-width: 100%;
+    min-width: 0;
     box-sizing: border-box;
     user-select: text;
     cursor: text;
@@ -2867,6 +2896,23 @@ function renderChatArea(
   item: Zotero.Item,
   initiallyVisible = false,
 ): void {
+  // 注入 Markdown 主题 CSS（如果尚未注入）
+  const existingChatStyle = doc.getElementById("ai-butler-chat-theme");
+  if (!existingChatStyle) {
+    import("./themeManager").then(async ({ themeManager }) => {
+      const themeCss = await themeManager.loadThemeCss();
+      const katexCss = await themeManager.loadKatexCss();
+      const adaptedCss = themeManager.adaptCssForSidebar(themeCss);
+      let styleEl = doc.getElementById("ai-butler-chat-theme") as HTMLStyleElement | null;
+      if (!styleEl) {
+        styleEl = doc.createElement("style");
+        styleEl.id = "ai-butler-chat-theme";
+        (doc.body || doc.documentElement)?.appendChild(styleEl);
+      }
+      styleEl.textContent = katexCss + "\n" + adaptedCss;
+    });
+  }
+
   const rawHeight = Number(getPref("quickChatHeight" as any));
   const quickChatHeight =
     Number.isFinite(rawHeight) && rawHeight >= QUICK_CHAT_MIN_HEIGHT
@@ -2890,7 +2936,11 @@ function renderChatArea(
     border-radius: 6px;
     overflow: hidden;
     background: transparent;
+    height: ${quickChatHeight}px;
     margin-bottom: 12px;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
   `;
 
   const chatHeader = doc.createElement("div");
@@ -2949,9 +2999,16 @@ function renderChatArea(
     flex: 1;
     min-height: 120px;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 8px;
     font-size: 12px;
     line-height: 1.5;
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
   `;
 
   // 输入区域
@@ -3082,6 +3139,7 @@ function renderChatArea(
     quickChatBtn: HTMLButtonElement | undefined,
   ): Promise<void> => {
     chatArea.style.display = "flex";
+    chatResizeHandle.style.display = "flex";
     setQuickChatButtonActive(quickChatBtn, true);
     inputBox.focus();
     await loadPdfContentIfNeeded();
@@ -3089,6 +3147,7 @@ function renderChatArea(
 
   const hideChatArea = (quickChatBtn: HTMLButtonElement | undefined): void => {
     chatArea.style.display = "none";
+    chatResizeHandle.style.display = "none";
     setQuickChatButtonActive(quickChatBtn, false);
   };
 
@@ -3166,14 +3225,20 @@ function renderChatArea(
       background: rgba(89, 192, 188, 0.1);
       border-radius: 6px;
       border-left: 3px solid #59c0bc;
+      user-select: text;
+      -webkit-user-select: text;
     `;
     const userTitle = doc.createElement("strong");
     userTitle.textContent = "👤 您:";
     const userContentDiv = doc.createElement("div");
+    userContentDiv.className = "markdown-body";
     userContentDiv.style.cssText = `
       margin-top: 6px;
       overflow-wrap: anywhere;
       word-break: break-word;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
     `;
     safeSetQuickChatMarkdown(userContentDiv, question);
     userMsgDiv.appendChild(userTitle);
@@ -3219,14 +3284,20 @@ function renderChatArea(
       background: rgba(128, 128, 128, 0.05);
       border-radius: 6px;
       border-left: 3px solid #667eea;
+      user-select: text;
+      -webkit-user-select: text;
     `;
     const aiTitle = doc.createElement("strong");
     aiTitle.textContent = "🤖 AI管家:";
     const aiContentDiv = doc.createElement("div");
+    aiContentDiv.className = "markdown-body";
     aiContentDiv.style.cssText = `
       margin-top: 6px;
       overflow-wrap: anywhere;
       word-break: break-word;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
     `;
     aiContentDiv.innerHTML = `<em style="color: #999;">思考中...</em>`;
     aiMsgDiv.appendChild(aiTitle);
@@ -3264,6 +3335,10 @@ function renderChatArea(
 
     try {
       const { default: LLMService } = await import("./llmService");
+      await ensureQuickChatMarkdownParser();
+
+      // parser 就绪后再渲染一次，确保用户提问按 Markdown 显示
+      safeSetQuickChatMarkdown(userContentDiv, question);
 
       // 快速提问的关键：每次只发送论文+当前问题，不累积历史
       // 若 PDF 有选中文本，则仅在本轮附加为引用上下文

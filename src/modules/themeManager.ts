@@ -151,6 +151,23 @@ export class ThemeManager {
     // 调整 max-width
     adapted = adapted.replace(/max-width:\s*\d+px;/g, "max-width: 100%;");
 
+    // 将 width: max-content / fit-content 替换为 width: 100%（防止表格等内容撑宽容器）
+    adapted = adapted.replace(
+      /width:\s*max-content;/g,
+      "width: 100%;",
+    );
+    adapted = adapted.replace(
+      /width:\s*fit-content;/g,
+      "width: 100%;",
+    );
+
+    // 将 table 的 display: block 替换回 display: table
+    // display: block 会让 table-layout: fixed 失效，导致表格固有宽度撑开容器
+    adapted = adapted.replace(
+      /\.markdown-body\s+table\s*\{([^}]*)display:\s*block;/g,
+      ".markdown-body table { $1 display: table;",
+    );
+
     // 移除外部字体引用（可能无法加载）
     adapted = adapted.replace(
       /@font-face\s*\{[^}]*url\([^)]*\.woff2[^)]*\)[^}]*\}/g,
@@ -249,26 +266,43 @@ export class ThemeManager {
   overflow-x: hidden !important;
   width: 100% !important;
   max-width: 100% !important;
+  min-width: 0 !important;
 }
 .ai-butler-note-content {
   width: 100% !important;
   max-width: 100% !important;
+  min-width: 0 !important;
   overflow-x: hidden !important;
   user-select: text !important;
   cursor: text;
+}
+/* markdown-body 与 ai-butler-note-content 共存于同一元素，也需要约束 */
+.ai-butler-note-content.markdown-body {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  overflow-x: hidden !important;
+  box-sizing: border-box !important;
 }
 .ai-butler-note-content * {
   user-select: text !important;
 }
 
-/* 约束 Zotero 侧边栏容器和父元素的宽度 */
-.item-pane-custom-section-container,
+/* 约束插件自身容器的宽度 */
 .ai-butler-note-section,
 .ai-butler-note-header {
   width: 100% !important;
   max-width: 100% !important;
-  overflow: hidden !important;
+  min-width: 0 !important;
   box-sizing: border-box !important;
+}
+
+/* 关键：约束 Zotero 原生 flex 容器的 min-width，否则 flex item 不会收缩到内容宽度以下。
+   只添加 min-width: 0，不添加 overflow:hidden，避免破坏 collapsible-section 的折叠动画 */
+item-pane-custom-section,
+item-pane-custom-section collapsible-section,
+item-pane-custom-section collapsible-section > [data-type="body"] {
+  min-width: 0 !important;
 }
 
 /* 确保整个侧边栏区域的内容不会溢出 */
@@ -276,39 +310,23 @@ export class ThemeManager {
 .item-details .ai-butler-note-section {
   width: 100% !important;
   max-width: 100% !important;
-  overflow: hidden !important;
+  min-width: 0 !important;
 }
 
-/* 表格样式 - 动态宽度 + 自动换行 + 横向滚动 */
+/* 表格样式 - 强制使用固定布局，表格永远不会超过容器宽度 */
 .ai-butler-note-content table {
-  display: block !important;
-  width: 100%;
-  max-width: 100%;
-  overflow-x: auto !important;
-  overflow-y: visible !important;
-  border-collapse: collapse;
-  box-sizing: border-box;
+  table-layout: fixed !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  border-collapse: collapse !important;
+  box-sizing: border-box !important;
 }
 .ai-butler-note-content table th,
 .ai-butler-note-content table td {
   word-wrap: break-word;
   overflow-wrap: break-word;
   padding: 6px 13px;
-}
-/* 表格滚动容器样式 */
-.ai-butler-note-content table::-webkit-scrollbar {
-  height: 8px;
-}
-.ai-butler-note-content table::-webkit-scrollbar-track {
-  background: #f0f0f0;
-  border-radius: 4px;
-}
-.ai-butler-note-content table::-webkit-scrollbar-thumb {
-  background: #888;
-  border-radius: 4px;
-}
-.ai-butler-note-content table::-webkit-scrollbar-thumb:hover {
-  background: #555;
+  overflow: hidden;
 }
 
 /* 暗色模式下的文字颜色修正 */
@@ -348,6 +366,62 @@ export class ThemeManager {
   .ai-butler-note-content hr {
     background-color: #444 !important;
   }
+}
+
+/* 防止内容元素撑宽容器 */
+.ai-butler-note-content img {
+  max-width: 100% !important;
+  height: auto !important;
+  box-sizing: border-box !important;
+}
+.ai-butler-note-content pre,
+.ai-butler-note-content code {
+  max-width: 100% !important;
+  overflow-x: auto !important;
+  box-sizing: border-box !important;
+}
+.ai-butler-note-content pre {
+  overflow-x: auto !important;
+}
+.ai-butler-note-content blockquote {
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
+.ai-butler-note-content ul,
+.ai-butler-note-content ol {
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
+.ai-butler-note-content .katex-display {
+  max-width: 100% !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+}
+
+/* 快速提问窗口中的 markdown-body 换行约束 */
+#ai-butler-inline-chat .markdown-body {
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  box-sizing: border-box !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  background: transparent !important;
+  font-size: inherit !important;
+}
+#ai-butler-inline-chat .markdown-body pre {
+  overflow-x: auto !important;
+  max-width: 100% !important;
+}
+#ai-butler-inline-chat .markdown-body img {
+  max-width: 100% !important;
+}
+#ai-butler-inline-chat .markdown-body table {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow-x: auto !important;
 }
 `;
     adapted += mathStyles;
